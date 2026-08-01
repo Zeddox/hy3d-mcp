@@ -24,7 +24,23 @@ engine is the caller's job (for Godot: copy into the project and run
 The server itself carries no ML dependencies; it shells out to the Swift
 binary and the worker venv.
 
-## Install
+## Install as a Claude Code plugin (recommended)
+
+The repo is also a Claude Code plugin that bundles the MCP server plus a
+`create-3d-model` skill (prompt → concept image → GLB, with all the
+input doctrine baked in):
+
+```
+/plugin marketplace add <owner>/hy3d-mcp
+/plugin install hy3d-gen@hy3d-mcp
+```
+
+Once installed, ask for a 3D model in plain language or invoke
+`/hy3d-gen:create-3d-model`. The server starts via
+`uv run --project <plugin-root> hy3d-mcp` — uv resolves the venv on first
+run.
+
+## Install as a bare MCP server
 
 ```sh
 git clone <this repo> ~/git/repos/hy3d-mcp

@@ -1,0 +1,12 @@
+{
+  "name": "hy3d-mcp",
+  "description": "Local image-to-3D generation tools for Apple Silicon: the hy3d-gen MCP server and skill, wrapping Hunyuan3D-MLX.",
+  "owner": { "name": "Jim Cline" },
+  "plugins": [
+    {
+      "name": "hy3d-gen",
+      "source": "./",
+      "description": "Local image-to-3D generation: prompt or concept image in, textured GLB out, via Hunyuan3D-MLX on Apple Silicon."
+    }
+  ]
+}
