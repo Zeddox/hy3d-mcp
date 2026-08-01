@@ -31,7 +31,7 @@ The repo is also a Claude Code plugin that bundles the MCP server plus a
 input doctrine baked in):
 
 ```
-/plugin marketplace add <owner>/hy3d-mcp
+/plugin marketplace add JimCline/hy3d-mcp
 /plugin install hy3d-gen@hy3d-mcp
 ```
 
@@ -43,7 +43,7 @@ run.
 ## Install as a bare MCP server
 
 ```sh
-git clone <this repo> ~/git/repos/hy3d-mcp
+git clone https://github.com/JimCline/hy3d-mcp ~/git/repos/hy3d-mcp
 ```
 
 Register with your MCP client (e.g. in `.mcp.json` or Claude Code's
