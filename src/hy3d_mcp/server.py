@@ -25,6 +25,7 @@ HY3D_PY = Path(os.environ.get("HY3D_PY", "~/git/repos/trellis-mac/.venv/bin/pyth
 HY3D_OUT = Path(os.environ.get("HY3D_OUT", "~/hy3d-output")).expanduser()
 
 WORKERS = Path(__file__).parent / "workers"
+INSTALLER = Path(__file__).resolve().parent.parent.parent / "install.sh"
 BINARY = HY3D_REPO / ".build/release/hy3d"
 METALLIB_DIR = HY3D_REPO / "metallib"
 # .build/release is a symlink; this is the real dir the binary also loads from
@@ -32,6 +33,8 @@ BUILD_REAL = HY3D_REPO / ".build/arm64-apple-macosx/release"
 
 GENERATE_TIMEOUT = 1800.0
 WORKER_TIMEOUT = 300.0
+# A cold setup is a ~4 min build plus a 12GB download on whatever link is going.
+SETUP_TIMEOUT = 7200.0
 
 mcp = FastMCP(
     "hy3d-gen",
@@ -103,14 +106,41 @@ def generate_model(
     seed: int = 42,
     auto_cutout: bool = True,
     finish: bool = False,
+    octree: int | None = None,
+    paint_res: int | None = None,
+    paint_steps: int | None = None,
+    steps: int | None = None,
+    guidance: float | None = None,
+    superres: bool = True,
 ) -> dict:
     """Turn a concept image into a textured 3D model (GLB).
 
     paint=False skips texturing (shape only, ~20s vs ~3-4 min).
     auto_cutout keys out a plain background first unless the input already
     carries real transparency. finish=True applies the game-look texture
-    pass (see finish_model) after generation. texture_size: 512|1024|2048.
+    pass (see finish_model) after generation.
     Blocks while an earlier generation is running (single-job queue).
+
+    Quality knobs, in rough order of effect. Each defaults to None, which
+    omits the flag so the binary's own default (in parens) applies. Paint
+    peaks ~25-33GB unified memory and octree/paint_res/texture_size each
+    multiply that, so raise them one at a time.
+
+      octree (256)      marching-cubes resolution — the geometry lever.
+                        384/512 resolve thin struts the default fuses;
+                        vertex count grows roughly cubically.
+      paint_res (512)   resolution the multiview texture diffusion runs
+                        at — the texture-sharpness lever.
+      paint_steps (15)  texture diffusion steps; low next to shape's 30.
+      steps (30)        shape diffusion steps; diminishing past ~50.
+      guidance (5.0)    how tightly shape follows the image; higher is
+                        more faithful but can over-sharpen.
+
+    texture_size: 512|1024|2048|4096, baked texture resolution. The binary's
+    own pbr default is 4096; 2048 here keeps peak memory modest.
+    superres=False skips the texture super-resolution pass.
+    The binary itself validates none of these — out-of-range values fail
+    slowly or bake garbage, so prefer moving one knob a single step.
     """
     global _queue_depth
     src = Path(image_path).expanduser()
@@ -121,8 +151,14 @@ def generate_model(
             im.verify()
     except Exception as e:
         raise ValueError("input is not a readable image: %s (%s)" % (src, e))
-    if texture_size not in (512, 1024, 2048):
-        raise ValueError("texture_size must be 512, 1024 or 2048")
+    if texture_size not in (512, 1024, 2048, 4096):
+        raise ValueError("texture_size must be 512, 1024, 2048 or 4096")
+    for name, val in (("octree", octree), ("paint_res", paint_res),
+                      ("paint_steps", paint_steps), ("steps", steps)):
+        if val is not None and val < 1:
+            raise ValueError("%s must be a positive integer" % name)
+    if guidance is not None and guidance < 0:
+        raise ValueError("guidance must be >= 0")
 
     dst = _out_path(src.stem, ".glb", output_path)
     stages: list[str] = []
@@ -141,9 +177,21 @@ def generate_model(
             cmd = [str(BINARY), "generate", str(gen_input), "-o", str(dst),
                    "--shape-weights", "weights/shape-small",
                    "--seed", str(seed)]
+            if steps is not None:
+                cmd += ["--steps", str(steps)]
+            if guidance is not None:
+                cmd += ["--guidance", str(guidance)]
+            if octree is not None:
+                cmd += ["--octree", str(octree)]
             if paint:
                 cmd += ["--paint-weights", "weights/paint-large",
                         "--paint-model", "pbr", "--tex", str(texture_size)]
+                if paint_steps is not None:
+                    cmd += ["--paint-steps", str(paint_steps)]
+                if paint_res is not None:
+                    cmd += ["--res", str(paint_res)]
+                if not superres:
+                    cmd.append("--no-superres")
             env = os.environ | {"METAL_PATH": str(METALLIB_DIR),
                                 "MLX_METAL_PATH": str(METALLIB_DIR)}
             proc = subprocess.run(cmd, cwd=HY3D_REPO, env=env,
@@ -277,14 +325,18 @@ def _check(ok: bool, fix: str) -> dict:
 def _server_status() -> dict:
     binary = _check(
         BINARY.is_file() and os.access(BINARY, os.X_OK),
-        "build the generator: cd %s && swift build -c release" % HY3D_REPO)
+        "run the setup_engine tool, or build it directly: "
+        "cd %s && swift build -c release" % HY3D_REPO)
 
     metallib = _check(
         (METALLIB_DIR / "default.metallib").is_file()
         and (BUILD_REAL / "default.metallib").is_file(),
         "swift build never emits the MLX metallib (mlx-swift SwiftPM "
-        "limitation). Install pip mlx matching Package.resolved (e.g. "
-        "`uv pip install mlx==0.31.4`), then copy "
+        "limitation). Run the setup_engine tool, or by hand: pip mlx and "
+        "mlx-swift are separate version series, so install the newest pip "
+        "mlx sharing Package.resolved's major.minor — mlx-swift 0.31.4 "
+        "means `uv pip install mlx==0.31.2`, as there is no pip 0.31.4 — "
+        "then copy "
         "site-packages/mlx/lib/mlx.metallib as BOTH mlx.metallib and "
         "default.metallib into %s AND into %s (the real build dir — "
         ".build/release is a symlink)" % (METALLIB_DIR, BUILD_REAL))
@@ -293,8 +345,9 @@ def _server_status() -> dict:
     weights = _check(
         (weights_root / "shape-small").is_dir()
         and (weights_root / "paint-large").is_dir(),
-        "download the model weights (~12GB) into %s/{shape-small,paint-large} "
-        "per the Hunyuan3D-MLX README" % weights_root)
+        "run the setup_engine tool, or download the model weights (~12GB) "
+        "into %s/{shape-small,paint-large} yourself per the Hunyuan3D-MLX "
+        "README" % weights_root)
 
     paint = weights_root / "paint-large"
     needed = [paint / "hunyuan3d-paint-v2-0" / "vae",
@@ -311,17 +364,20 @@ def _server_status() -> dict:
         "hunyuan3d-paintpbr-v2-1/ && ln -s dinov2 dinov2-giant" % paint)
 
     venv_ok = False
-    venv_fix = ("worker venv missing: set HY3D_PY to a python with "
-                "cv2/numpy/trimesh/PIL/scipy installed")
+    venv_fix = ("worker venv missing: run the setup_engine tool, or set "
+                "HY3D_PY to a python with cv2/numpy/trimesh/PIL/scipy")
     if HY3D_PY.is_file():
         probe = subprocess.run(
             [str(HY3D_PY), "-c", "import cv2, numpy, trimesh, PIL, scipy"],
             capture_output=True, text=True, timeout=60.0)
         venv_ok = probe.returncode == 0
         if not venv_ok:
+            # uv, not `python -m pip`: uv-created venvs ship without pip, so
+            # the pip form fails with "No module named pip" on a stock setup.
             venv_fix = ("worker venv at %s is missing packages: %s — install "
-                        "them with `%s -m pip install opencv-python numpy "
-                        "trimesh pillow scipy`"
+                        "them with `uv pip install --python %s opencv-python "
+                        "numpy trimesh pillow scipy`, or run the setup_engine "
+                        "tool"
                         % (HY3D_PY, probe.stderr.strip()[-300:], HY3D_PY))
 
     return {
@@ -342,6 +398,67 @@ def server_status() -> dict:
     reports queue depth and the last job.
     """
     return _server_status()
+
+
+@mcp.tool
+def setup_engine(
+    confirm: bool = False,
+    only: int | None = None,
+    repo: str | None = None,
+    worker_venv: str | None = None,
+) -> dict:
+    """Install or repair the Hunyuan3D-MLX engine this server shells out to.
+
+    Runs the bundled install.sh: checkout, swift build, metallib harvest,
+    ~12GB weight download, paint-large relayout, worker venv. Every phase
+    inspects before acting, so re-running after a failure resumes.
+
+    Defaults to a DRY RUN — it reports the plan and changes nothing. Show
+    that plan to the user, and only re-call with confirm=True once they
+    have agreed: applying costs a ~4 minute build and a ~12GB download.
+    only=N runs a single phase (1 preflight, 2 clone, 3 build, 4 metallib,
+    5 weights, 6 layout, 7 worker venv). Blocks generation while it runs.
+    """
+    global _queue_depth
+    if not INSTALLER.is_file():
+        raise RuntimeError("installer not found at %s" % INSTALLER)
+    if only is not None and not 1 <= only <= 7:
+        raise ValueError("only must be a phase number from 1 to 7")
+
+    argv = [str(INSTALLER), "--yes" if confirm else "--plan"]
+    if only is not None:
+        argv += ["--only", str(only)]
+    if repo:
+        argv += ["--repo", str(Path(repo).expanduser())]
+    if worker_venv:
+        argv += ["--worker-venv", str(Path(worker_venv).expanduser())]
+
+    started = time.monotonic()
+    with _queue_guard:
+        _queue_depth += 1
+    try:
+        with _job_lock:
+            proc = subprocess.run(["/bin/bash"] + argv, capture_output=True,
+                                  text=True, timeout=SETUP_TIMEOUT)
+    finally:
+        with _queue_guard:
+            _queue_depth -= 1
+
+    seconds = time.monotonic() - started
+    ok = proc.returncode == 0
+    _record_job("setup_engine", "plan" if not confirm else "apply", ok, seconds)
+    out = (proc.stdout or "") + (proc.stderr or "")
+    result = {"mode": "plan" if not confirm else "apply", "ok": ok,
+              "seconds": round(seconds, 1), "output": out.strip()[-6000:]}
+    if not confirm:
+        result["next"] = ("nothing was executed. Relay this plan to the user; "
+                          "re-call with confirm=True only once they agree to "
+                          "the build and the ~12GB download.")
+    else:
+        result["next"] = ("call server_status to verify" if ok else
+                          "setup did not finish; the output says which phase "
+                          "failed. Re-calling resumes from there.")
+    return result
 
 
 def main() -> None:

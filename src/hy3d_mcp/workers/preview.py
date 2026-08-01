@@ -33,9 +33,12 @@ def main() -> None:
         import trimesh
         import pyrender
     except ImportError as e:
+        # uv, not `python -m pip`: uv-created venvs ship without pip. Name the
+        # real interpreter too, so the command is runnable as printed.
         print(json.dumps({
             "error": "missing %r in the worker venv — install it with: "
-                     "<HY3D_PY> -m pip install pyrender" % e.name,
+                     "uv pip install --python %s %s"
+                     % (e.name, sys.executable, e.name),
         }))
         sys.exit(2)
 

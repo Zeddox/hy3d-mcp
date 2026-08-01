@@ -12,9 +12,18 @@ model of X" to a GLB file path, with a preview when possible.
 
 ## First use in a session
 
-Call `server_status` once before the first generation. If any check is
-`ok: false`, relay its `fix` text to the user verbatim and stop — every
-failure carries its exact remedy. Don't re-check on later calls.
+Call `server_status` once before the first generation. Don't re-check on
+later calls.
+
+If any check is `ok: false`, the engine behind this server isn't set up
+yet. Call `setup_engine` — it defaults to a dry run, changes nothing, and
+returns the plan. Show that plan to the user, costs included (a ~4 minute
+`swift build`, a ~12GB weight download), and only call it again with
+`confirm=true` once they agree. Phases are idempotent, so a re-run after
+a failure resumes rather than restarting.
+
+If they would rather do it by hand, relay the failing check's `fix` text
+verbatim instead — every failure carries its exact remedy.
 
 ## Step 1 — get a concept image
 
@@ -62,6 +71,33 @@ Generation is serialized on the server (one job at a time, it's
 memory-bound) — a second call queuing behind a first is normal, not a
 hang. Do not fire generations in parallel expecting speedup.
 
+### Fidelity knobs
+
+These raise detail on a shape that is already correct. They will not fix
+a wrong shape — that is always the concept image's job. Each is unset by
+default, leaving the binary's own default (in parens) in force; the
+binary validates none of them, so move one knob a single step at a time
+and keep the seed fixed so you can attribute the difference.
+
+- `octree` (256) — marching-cubes resolution, the geometry lever. Try 384
+  when thin parts (struts, masts, antennae) come out fused into the hull.
+  Vertex count grows roughly cubically, and meshes are already ~70-80k at
+  the default.
+- `paint_res` (512) — resolution the multiview texture diffusion runs at.
+  The strongest texture-sharpness lever, and the one to reach for when
+  fine surface markings smear.
+- `paint_steps` (15) — texture diffusion steps, notably low next to
+  shape's 30. Usually the cheapest texture win.
+- `texture_size` (2048 here, but the binary's own pbr default is 4096) —
+  baked texture resolution.
+- `steps` (30) and `guidance` (5.0) — shape diffusion convergence and how
+  tightly the mesh follows the image. Least interesting of the set;
+  diminishing returns past ~50 steps, and high guidance over-sharpens.
+
+Paint peaks ~25-33GB unified memory, and `octree`, `paint_res` and
+`texture_size` each multiply that. Raising several at once is the usual
+way to turn a 4-minute job into a swap-thrashing one.
+
 ## Step 3 — show the result
 
 Call `render_preview` on the GLB (default iso view; add
@@ -77,6 +113,9 @@ importing is their engine's job (Godot: copy into the project, then
 
 - Wrong shape → change the concept image, not the generator knobs. The
   mesh follows the picture.
+- Right shape but soft or fused detail → that is the one case the
+  fidelity knobs above address; raise `octree` for geometry, `paint_res`
+  for texture.
 - Pale/washed-out texture → the concept was too flat-lit; regenerate it
   naturally lit.
 - Phantom pancake of geometry under the model → a shadow survived in the

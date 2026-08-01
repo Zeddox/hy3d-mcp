@@ -15,11 +15,12 @@ engine is the caller's job (for Godot: copy into the project and run
 
 - Apple Silicon Mac with ~48GB unified memory (texture paint peaks
   ~25–33GB)
+- Xcode or the Command Line Tools (for `swift`), and
+  [uv](https://docs.astral.sh/uv/)
+- ~15GB free disk: 12GB of weights, 1.3GB of build output
 - A built [Hunyuan3D-MLX](https://github.com/ZimengXiong/hunyuan3d-mlx)
-  checkout with weights downloaded (~12GB)
-- A "worker" Python environment with `opencv-python numpy trimesh pillow
-  scipy` (and `pyrender` if you want `render_preview`)
-- [uv](https://docs.astral.sh/uv/) to run the server
+  checkout and a worker Python environment — **[`./install.sh`](#set-up-the-engine)
+  builds both for you**; see that section before doing any of it by hand.
 
 The server itself carries no ML dependencies; it shells out to the Swift
 binary and the worker venv.
@@ -64,15 +65,98 @@ Register with your MCP client (e.g. in `.mcp.json` or Claude Code's
 All three env vars are optional; the values above are the defaults.
 `HY3D_PY` is any python interpreter with the worker packages installed.
 
-**First run: call the `server_status` tool.** It validates every setup
-requirement and each failing check carries the exact fix — including the
-three gotchas below, which every fresh Hunyuan3D-MLX build hits.
+## Set up the engine
+
+The server is a thin wrapper — the actual pipeline is a separate Swift
+checkout that has to be cloned, built, and fed 12GB of weights. Either
+let the installer do it or follow the manual sequence below; both end at
+the same place.
+
+### The installer
+
+```sh
+./install.sh --plan     # print exactly what it would do, change nothing
+./install.sh            # do it, confirming the build and the download
+```
+
+Seven phases — preflight, clone, `swift build`, metallib, weights,
+paint-large relayout, worker venv. **Every phase inspects before it
+acts**, so it is safe to re-run: finished work is skipped and a failed
+run resumes where it stopped. The cheap and idempotent phases run
+unattended; the two expensive ones (a ~4 minute build, a ~12GB download)
+stop and ask first. `--yes` runs unattended, `--only N` runs one phase,
+and `--repo` / `--worker-venv` relocate the targets.
+
+From inside an MCP client, the `setup_engine` tool is the same script.
+It defaults to a dry run and returns the plan; it only executes when
+called again with `confirm=true`, so the agent has to show you the cost
+before spending it.
+
+When it finishes it prints the `HY3D_REPO` and `HY3D_PY` values to put in
+your MCP config, and `server_status` should then come back all green.
+
+### Or by hand
+
+The engine's own
+[README](https://github.com/ZimengXiong/Hunyuan3D-MLX) covers steps 2–4;
+steps 5–7 are the parts it does not mention.
+
+```sh
+# 1. clone
+git clone https://github.com/ZimengXiong/Hunyuan3D-MLX.git ~/git/repos/hunyuan3d-mlx
+cd ~/git/repos/hunyuan3d-mlx
+
+# 2. build (~4 min)
+swift build -c release
+
+# 3-4. weights (~12GB)
+uvx --from huggingface_hub hf download \
+  zimengxiong/hunyuan3d-mlx-shape-small --local-dir weights/shape-small
+uvx --from huggingface_hub hf download \
+  zimengxiong/hunyuan3d-mlx-paint-large --local-dir weights/paint-large
+
+# 5. metallib — swift build never emits it; harvest it from the pip mlx wheel.
+#    NOTE: mlx-swift and pip mlx are separate version series. Package.resolved
+#    pins mlx-swift 0.31.4, but no such pip release exists — take the newest
+#    pip mlx in the matching 0.31.x series (0.31.2 at time of writing).
+uv venv /tmp/mlxharvest
+uv pip install --python /tmp/mlxharvest/bin/python mlx==0.31.2
+SRC=$(find /tmp/mlxharvest -name mlx.metallib | head -1)
+for d in metallib .build/arm64-apple-macosx/release; do
+  mkdir -p "$d" && cp "$SRC" "$d/mlx.metallib" && cp "$SRC" "$d/default.metallib"
+done
+
+# 6. paint-large ships flat, the binary wants it nested
+cd weights/paint-large
+mkdir -p hunyuan3d-paint-v2-0 hunyuan3d-paintpbr-v2-1
+ln -s ../vae ../unet hunyuan3d-paint-v2-0/
+ln -s ../vae ../unet hunyuan3d-paintpbr-v2-1/
+ln -s dinov2 dinov2-giant
+cd ../..
+
+# 7. worker venv — uv, not pip: uv-created venvs have no pip in them
+uv venv ~/.hy3d/worker-venv
+uv pip install --python ~/.hy3d/worker-venv/bin/python \
+  opencv-python numpy trimesh pillow scipy pyrender
+```
+
+Then set `HY3D_REPO=~/git/repos/hunyuan3d-mlx` and
+`HY3D_PY=~/.hy3d/worker-venv/bin/python`.
+
+**Either way, verify with the `server_status` tool.** It re-checks every
+requirement and each failing check carries its own fix.
 
 ## The three setup gotchas
 
+`install.sh` handles all three; they are documented here because they are
+what a by-the-book install of the upstream repo gets wrong, and what
+`server_status` is looking for when it fails.
+
 1. **Metallib** — `swift build` never emits the MLX metallib (mlx-swift
-   SwiftPM limitation). Harvest `mlx.metallib` from the pip `mlx` wheel of
-   the *same version* as Package.resolved, and copy it as both
+   SwiftPM limitation). Harvest `mlx.metallib` from the pip `mlx` wheel —
+   *not* the version string in Package.resolved, which is mlx-**swift**'s
+   own series and has no pip counterpart (there is no pip `mlx` 0.31.4).
+   Take the newest pip `mlx` sharing its major.minor, and copy it as both
    `mlx.metallib` and `default.metallib` into `metallib/` **and** into
    `.build/arm64-apple-macosx/release/` (the real dir — `.build/release`
    is a symlink).
@@ -92,6 +176,7 @@ three gotchas below, which every fresh Hunyuan3D-MLX build hits.
 | `finish_model` | game-look texture pass: toned albedo + accent/seam emissive | seconds |
 | `render_preview` | offscreen PNG renders (iso/front/back/top/side) | seconds |
 | `server_status` | full setup diagnostic, queue depth, last job | instant |
+| `setup_engine` | runs `install.sh`; dry run unless `confirm=true` | instant (plan) / up to an hour (apply) |
 
 Generation is serialized — one job at a time; concurrent calls queue
 rather than OOM the machine.
