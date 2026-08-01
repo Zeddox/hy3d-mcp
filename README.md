@@ -114,4 +114,30 @@ rather than OOM the machine.
 
 ## License
 
-MIT
+MIT — but that covers **this wrapper code only**. This repo distributes no
+model weights and no Tencent code.
+
+### Model weights license (read this)
+
+The pipeline runs on Tencent's Hunyuan3D weights, which you download
+yourself and which are governed by the **Tencent Hunyuan 3D 2.0 / 2.1
+Community License Agreements** ([2.0](https://huggingface.co/tencent/Hunyuan3D-2/blob/main/LICENSE),
+[2.1](https://huggingface.co/tencent/Hunyuan3D-2.1/blob/main/LICENSE)) —
+the paint stage uses both generations, so both apply. Highlights, not
+legal advice; read the licenses:
+
+- **Territory:** the license does not apply in the European Union, the
+  United Kingdom, or South Korea. If you're there, you may not use the
+  weights at all.
+- **Scale:** products/services exceeding 1M monthly active users require
+  written permission from Tencent.
+- **Attribution:** distributing or productizing anything built on the
+  weights requires the Tencent license notice; 2.1 asks for a "Powered by
+  Tencent Hunyuan" mark.
+- **Acceptable use:** no training competing models on it, no undisclosed
+  synthetic-media deception, no military use, among others.
+- **Your outputs are yours:** Tencent claims no rights to generated 3D
+  models; you own them and are responsible for how you use them.
+
+The [Hunyuan3D-MLX](https://github.com/ZimengXiong/Hunyuan3D-MLX) Swift
+port this server shells out to is itself MIT-licensed.
