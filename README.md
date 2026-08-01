@@ -56,7 +56,7 @@ Register with your MCP client (e.g. in `.mcp.json` or Claude Code's
   "args": ["run", "--project", "~/git/repos/hy3d-mcp", "hy3d-mcp"],
   "env": {
     "HY3D_REPO": "~/git/repos/hunyuan3d-mlx",
-    "HY3D_PY": "~/git/repos/trellis-mac/.venv/bin/python",
+    "HY3D_PY": "~/.hy3d/worker-venv/bin/python",
     "HY3D_OUT": "~/hy3d-output"
   }
 }

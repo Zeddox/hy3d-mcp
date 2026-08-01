@@ -6,7 +6,7 @@ the scripts in workers/. Tools return file paths, never blobs.
 
 Config (env, with defaults):
   HY3D_REPO  Hunyuan3D-MLX checkout        (~/git/repos/hunyuan3d-mlx)
-  HY3D_PY    worker venv python w/ cv2 etc (~/git/repos/trellis-mac/.venv/bin/python)
+  HY3D_PY    worker venv python w/ cv2 etc (~/.hy3d/worker-venv/bin/python)
   HY3D_OUT   default output directory      (~/hy3d-output)
 """
 import json
@@ -21,7 +21,7 @@ from fastmcp import FastMCP
 from PIL import Image
 
 HY3D_REPO = Path(os.environ.get("HY3D_REPO", "~/git/repos/hunyuan3d-mlx")).expanduser()
-HY3D_PY = Path(os.environ.get("HY3D_PY", "~/git/repos/trellis-mac/.venv/bin/python")).expanduser()
+HY3D_PY = Path(os.environ.get("HY3D_PY", "~/.hy3d/worker-venv/bin/python")).expanduser()
 HY3D_OUT = Path(os.environ.get("HY3D_OUT", "~/hy3d-output")).expanduser()
 
 WORKERS = Path(__file__).parent / "workers"
