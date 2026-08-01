@@ -21,3 +21,7 @@ build-backend = "hatchling.build"
 
 [tool.hatch.build.targets.wheel]
 packages = ["src/hy3d_mcp"]
+
+# A wheel carries no repo root, so setup_engine could not find the installer.
+[tool.hatch.build.targets.wheel.force-include]
+"install.sh" = "hy3d_mcp/install.sh"

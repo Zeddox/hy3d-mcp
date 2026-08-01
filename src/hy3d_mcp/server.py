@@ -25,7 +25,19 @@ HY3D_PY = Path(os.environ.get("HY3D_PY", "~/.hy3d/worker-venv/bin/python")).expa
 HY3D_OUT = Path(os.environ.get("HY3D_OUT", "~/hy3d-output")).expanduser()
 
 WORKERS = Path(__file__).parent / "workers"
-INSTALLER = Path(__file__).resolve().parent.parent.parent / "install.sh"
+
+
+def _find_installer() -> Path:
+    """install.sh sits at the repo root in a checkout or plugin cache, and
+    beside the package in a wheel (force-included there, since a wheel
+    carries no repo root). Prefer the checkout so a source tree under
+    development wins over a stale installed copy."""
+    here = Path(__file__).resolve()
+    root, packaged = here.parent.parent.parent / "install.sh", here.parent / "install.sh"
+    return packaged if packaged.is_file() and not root.is_file() else root
+
+
+INSTALLER = _find_installer()
 BINARY = HY3D_REPO / ".build/release/hy3d"
 METALLIB_DIR = HY3D_REPO / "metallib"
 # .build/release is a symlink; this is the real dir the binary also loads from
