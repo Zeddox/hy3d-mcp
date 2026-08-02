@@ -23,7 +23,7 @@ ENGINE_GIT="https://github.com/ZimengXiong/Hunyuan3D-MLX.git"
 # directory too or the binary starts and then fails to find its Metal kernels.
 BUILD_REAL_REL=".build/arm64-apple-macosx/release"
 
-WORKER_PKGS=(opencv-python numpy trimesh pillow scipy pyrender)
+WORKER_PKGS=(opencv-python numpy trimesh pillow scipy pyrender pygltflib)
 SHAPE_HF="zimengxiong/hunyuan3d-mlx-shape-small"
 PAINT_HF="zimengxiong/hunyuan3d-mlx-paint-large"
 
@@ -332,14 +332,14 @@ worker_venv() {
     if [ -n "${HY3D_PY:-}" ]; then
         local configured="${HY3D_PY/#\~/$HOME}"
         if [ -x "$configured" ] && "$configured" -c \
-           "import cv2, numpy, trimesh, PIL, scipy, pyrender" 2>/dev/null; then
+           "import cv2, numpy, trimesh, PIL, scipy, pyrender, pygltflib" 2>/dev/null; then
             skip "HY3D_PY already satisfies every worker package ($configured)"
             WORKER_VENV="$(dirname "$(dirname "$configured")")"
             return 0
         fi
     fi
 
-    if [ -x "$py" ] && "$py" -c "import cv2, numpy, trimesh, PIL, scipy, pyrender" 2>/dev/null; then
+    if [ -x "$py" ] && "$py" -c "import cv2, numpy, trimesh, PIL, scipy, pyrender, pygltflib" 2>/dev/null; then
         skip "already has every worker package"
         return 0
     fi
@@ -353,7 +353,7 @@ worker_venv() {
     # uv, not pip: uv-created venvs have no pip in them at all.
     uv pip install --python "$py" "${WORKER_PKGS[@]}" >/dev/null 2>&1 \
         || { bad "package install failed — retry with: uv pip install --python $py ${WORKER_PKGS[*]}"; return 1; }
-    "$py" -c "import cv2, numpy, trimesh, PIL, scipy, pyrender" 2>/dev/null \
+    "$py" -c "import cv2, numpy, trimesh, PIL, scipy, pyrender, pygltflib" 2>/dev/null \
         && ok "all worker packages import" \
         || bad "packages installed but the import check still fails"
 }

@@ -57,7 +57,9 @@ Call `generate_model` with the image path. Defaults are right for most
 cases; the knobs that matter:
 
 - `paint: false` for a ~20-second shape-only draft when the user is
-  iterating on silhouette; full shape+paint takes ~3–4 minutes.
+  iterating on silhouette; full shape+paint takes ~3–4 minutes. It runs a
+  different engine subcommand, so `paint_res`, `paint_steps` and `finish`
+  are rejected alongside it, and no preview sheet is written.
 - `auto_cutout` (default true) keys the background out automatically. If
   it errors saying the corners disagree, the background isn't plain —
   regenerate the concept, don't fight the cutout.
@@ -69,7 +71,16 @@ cases; the knobs that matter:
 
 Generation is serialized on the server (one job at a time, it's
 memory-bound) — a second call queuing behind a first is normal, not a
-hang. Do not fire generations in parallel expecting speedup.
+hang. Do not fire generations in parallel expecting speedup. The call
+streams progress the whole way, so a long job is visibly working; a
+detailed concept can legitimately paint for 13+ minutes. If a call is
+ever abandoned mid-flight and later calls appear to hang, `cancel_job`
+frees the queue.
+
+Outputs get the glTF `NORMAL` attribute injected by default, which the
+engine itself omits. Leave `normals` alone — without it Godot lights the
+whole mesh off one constant vector, which looks like a bad material
+rather than a missing attribute.
 
 ### Fidelity knobs
 
@@ -80,9 +91,14 @@ binary validates none of them, so move one knob a single step at a time
 and keep the seed fixed so you can attribute the difference.
 
 - `octree` (256) — marching-cubes resolution, the geometry lever. Try 384
-  when thin parts (struts, masts, antennae) come out fused into the hull.
-  Vertex count grows roughly cubically, and meshes are already ~70-80k at
-  the default.
+  when thin parts (struts, masts, antennae) come out **fused into the
+  hull** — that specific failure, not as a general quality dial. Its cost
+  scales with how much fine detail the concept carries, not just with the
+  number: a smooth hull at 384 took ~6 minutes, while a lattice/greeble-
+  heavy subject took 16.5 and drove the machine into swap, having already
+  resolved its truss braces fine at the default. Vertex count grows
+  roughly cubically and meshes are already ~70-80k at the default, with
+  ~4.5× spread across subjects at identical settings.
 - `paint_res` (512) — resolution the multiview texture diffusion runs at.
   The strongest texture-sharpness lever, and the one to reach for when
   fine surface markings smear.
@@ -102,8 +118,16 @@ way to turn a 4-minute job into a swap-thrashing one.
 
 Call `render_preview` on the GLB (default iso view; add
 `front,back,top,side` when the user wants a full turnaround) and show the
-PNG(s) to the user. If it errors about pyrender, give the user the
-install command from the error and move on — the GLB is still good.
+PNG(s) to the user.
+
+Check `source` in the reply. `"rendered"` means you got the views you
+asked for. `"generator_sheets"` means rasterising failed — usually no
+window server from a daemonised MCP process — and you are looking at the
+multiview and render-check contact sheets the paint pass wrote beside the
+GLB instead. Those are perfectly good for judging a result; just say so
+rather than describing them as the requested angles. Only shape-only
+output has no sheets, and there the call errors outright — the GLB is
+still fine.
 
 Report the `glb_path` plainly. If the user works in a game engine,
 importing is their engine's job (Godot: copy into the project, then

@@ -9,6 +9,7 @@ Config (env, with defaults):
   HY3D_PY    worker venv python w/ cv2 etc (~/.hy3d/worker-venv/bin/python)
   HY3D_OUT   default output directory      (~/hy3d-output)
 """
+import asyncio
 import json
 import os
 import re
@@ -17,7 +18,7 @@ import threading
 import time
 from pathlib import Path
 
-from fastmcp import FastMCP
+from fastmcp import Context, FastMCP
 from PIL import Image
 
 HY3D_REPO = Path(os.environ.get("HY3D_REPO", "~/git/repos/hunyuan3d-mlx")).expanduser()
@@ -43,10 +44,16 @@ METALLIB_DIR = HY3D_REPO / "metallib"
 # .build/release is a symlink; this is the real dir the binary also loads from
 BUILD_REAL = HY3D_REPO / ".build/arm64-apple-macosx/release"
 
-GENERATE_TIMEOUT = 1800.0
+# A runaway backstop, not a normal bound: a lattice-heavy concept at octree
+# 384 legitimately runs 15+ minutes, and progress notifications now keep the
+# client from timing out underneath a job that is making progress.
+GENERATE_TIMEOUT = 5400.0
 WORKER_TIMEOUT = 300.0
 # A cold setup is a ~4 min build plus a 12GB download on whatever link is going.
 SETUP_TIMEOUT = 7200.0
+# Idle gap the client tolerates is what this has to stay under; paint's pbr
+# path can run many minutes without printing a line.
+HEARTBEAT_SECONDS = 15.0
 
 mcp = FastMCP(
     "hy3d-gen",
@@ -62,10 +69,13 @@ mcp = FastMCP(
 
 # One generation at a time: paint peaks ~25-33GB unified memory, so parallel
 # jobs would OOM the machine, not just slow it. Callers queue on the lock.
-_job_lock = threading.Lock()
+_job_lock = asyncio.Lock()
 _queue_depth = 0
 _queue_guard = threading.Lock()
 _last_job: dict | None = None
+# The engine child currently running, so cancel_job can reach it without a pid
+# hunt. Only one exists at a time — _job_lock sees to that.
+_current_proc: asyncio.subprocess.Process | None = None
 
 
 def _record_job(tool: str, target: str, ok: bool, seconds: float) -> None:
@@ -100,6 +110,123 @@ def _has_real_alpha(path: Path) -> bool:
         return lo < 128
 
 
+_PROGRESS_LINE = re.compile(r"^\s*\[\s*(\d+)\s*%\]\s*(.*)$")
+_STAGE_MARKER = re.compile(r"^generate\[(\d)/2\]\s*(\w+)")
+
+
+def _mmss(seconds: float) -> str:
+    return "%dm%02ds" % (int(seconds) // 60, int(seconds) % 60)
+
+
+async def _run_engine(cmd: list[str], env: dict[str, str], ctx: Context | None,
+                      two_stage: bool) -> tuple[int, str, str, bool]:
+    """Run the hy3d binary, relaying its progress to the MCP client.
+
+    Returns (returncode, stdout, stderr, streamed). Two things a plain
+    blocking run cannot do: relay a heartbeat — from outside, a slow job and
+    a hung one look identical, and clients abort on idle — and kill the
+    child when the call is cancelled, since an abandoned engine holds both
+    the single-job queue and the GPU until someone hunts down its pid.
+
+    `streamed` reports whether progress actually went anywhere: a client
+    that sends no progressToken gets no notifications, and that is worth
+    surfacing rather than leaving to be inferred from a later timeout.
+    """
+    global _current_proc
+    proc = await asyncio.create_subprocess_exec(
+        *cmd, cwd=str(HY3D_REPO), env=env,
+        stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE)
+    _current_proc = proc
+    # In a two-stage generate, shape owns the first half of the bar and paint
+    # the second; the shape subcommand alone owns all of it.
+    state = {"base": 0.0, "width": 50.0 if two_stage else 100.0,
+             "last": 0.0, "stage": "shape"}
+    out: list[str] = []
+    err: list[str] = []
+    started = time.monotonic()
+
+    async def report(value: float, message: str) -> None:
+        # MCP requires the value to rise, so clamp instead of stepping back.
+        state["last"] = max(state["last"], value)
+        if ctx is None:
+            return
+        try:
+            await ctx.report_progress(state["last"], 100.0, message)
+        except Exception:
+            # A heartbeat is never worth a bake. A client that has stopped
+            # listening should not take down the job it stopped listening to.
+            pass
+
+    async def drain(stream, buf: list[str], watch: bool) -> None:
+        # Both pipes get drained concurrently: a full stderr buffer blocks the
+        # child, which presents as exactly the hang this is here to prevent.
+        # The text is accumulated as well as streamed — the vert/face regex and
+        # the failure message downstream both need the whole thing.
+        async for raw in stream:
+            line = raw.decode("utf-8", "replace")
+            buf.append(line)
+            if not watch:
+                continue
+            m = _STAGE_MARKER.match(line)
+            if m:
+                state["stage"] = m.group(2)
+                state["base"] = 0.0 if m.group(1) == "1" else 50.0
+                continue
+            m = _PROGRESS_LINE.match(line)
+            if m:
+                await report(
+                    state["base"] + float(m.group(1)) / 100.0 * state["width"],
+                    "%s: %s" % (state["stage"], m.group(2).strip()))
+
+    async def heartbeat() -> None:
+        # The pbr paint path prints nothing for minutes at a stretch, so real
+        # progress lines alone would not keep the client's idle timer alive.
+        # The bar creeps toward the stage ceiling because the value must rise;
+        # the message carries the honest part, which is elapsed time.
+        while True:
+            await asyncio.sleep(HEARTBEAT_SECONDS)
+            ceiling = state["base"] + state["width"]
+            await report(state["last"] + (ceiling - state["last"]) * 0.05,
+                         "%s — %s elapsed"
+                         % (state["stage"], _mmss(time.monotonic() - started)))
+
+    meta = getattr(getattr(ctx, "request_context", None), "meta", None)
+    streamed = getattr(meta, "progressToken", None) is not None
+
+    beat = asyncio.create_task(heartbeat())
+    try:
+        async with asyncio.timeout(GENERATE_TIMEOUT):
+            await asyncio.gather(drain(proc.stdout, out, True),
+                                 drain(proc.stderr, err, False))
+            rc = await proc.wait()
+    except TimeoutError:
+        proc.kill()
+        await proc.wait()
+        raise RuntimeError("engine ran past %.0fs and was killed"
+                           % GENERATE_TIMEOUT)
+    except asyncio.CancelledError:
+        proc.kill()
+        await proc.wait()
+        raise
+    finally:
+        beat.cancel()
+        await asyncio.gather(beat, return_exceptions=True)
+        _current_proc = None
+    return rc, "".join(out), "".join(err), streamed
+
+
+def _add_normals(glb: Path) -> dict:
+    """Inject glTF NORMAL into a GLB in place.
+
+    Never raises. This runs after a model is already on disk, and losing a
+    finished bake to a post-step would be worse than shipping it flat-shaded.
+    """
+    try:
+        return _run_worker("normals.py", [str(glb)])
+    except Exception as e:
+        return {"normals_added": False, "warning": "normals pass failed: %s" % e}
+
+
 def _out_path(stem: str, suffix: str, explicit: str | None) -> Path:
     if explicit:
         p = Path(explicit).expanduser()
@@ -110,7 +237,7 @@ def _out_path(stem: str, suffix: str, explicit: str | None) -> Path:
 
 
 @mcp.tool
-def generate_model(
+async def generate_model(
     image_path: str,
     output_path: str | None = None,
     paint: bool = True,
@@ -124,13 +251,21 @@ def generate_model(
     steps: int | None = None,
     guidance: float | None = None,
     superres: bool = True,
+    normals: bool = True,
+    ctx: Context | None = None,
 ) -> dict:
     """Turn a concept image into a textured 3D model (GLB).
 
-    paint=False skips texturing (shape only, ~20s vs ~3-4 min).
+    paint=False skips texturing (shape only, ~20s vs ~3-4 min) — it runs a
+    different engine subcommand, so paint_res/paint_steps/finish are
+    rejected rather than ignored, and no .views.png sheet is written.
     auto_cutout keys out a plain background first unless the input already
     carries real transparency. finish=True applies the game-look texture
     pass (see finish_model) after generation.
+    normals=True (default) injects the glTF NORMAL attribute the engine
+    omits; without it Godot and friends light the whole mesh off one
+    constant vector, which reads as a bad material rather than a missing
+    attribute. Geometry is untouched either way.
     Blocks while an earlier generation is running (single-job queue).
 
     Quality knobs, in rough order of effect. Each defaults to None, which
@@ -171,80 +306,109 @@ def generate_model(
             raise ValueError("%s must be a positive integer" % name)
     if guidance is not None and guidance < 0:
         raise ValueError("guidance must be >= 0")
+    if not paint:
+        # Caught here rather than after a successful shape run, which would
+        # spend the geometry pass before failing.
+        dead = [n for n, v in (("paint_res", paint_res),
+                               ("paint_steps", paint_steps)) if v is not None]
+        if dead:
+            raise ValueError("paint=False runs the shape-only subcommand, "
+                             "which has no paint pass — remove %s or set "
+                             "paint=True" % " and ".join(dead))
+        if finish:
+            raise ValueError("finish=True needs a painted model — it retextures "
+                             "an albedo map that shape-only output lacks")
 
     dst = _out_path(src.stem, ".glb", output_path)
     stages: list[str] = []
+    warning: str | None = None
     started = time.monotonic()
     with _queue_guard:
         _queue_depth += 1
     try:
-        with _job_lock:
+        async with _job_lock:
             gen_input = src
             if auto_cutout and not _has_real_alpha(src):
                 rgba = HY3D_OUT / "intermediate" / (src.stem + "-rgba.png")
-                cut = _run_worker("cutout.py", [str(src), str(rgba)])
+                cut = await asyncio.to_thread(
+                    _run_worker, "cutout.py", [str(src), str(rgba)])
                 gen_input = Path(cut["png_path"])
                 stages.append("cutout (%.1f%% opaque)" % cut["opaque_pct"])
 
-            cmd = [str(BINARY), "generate", str(gen_input), "-o", str(dst),
-                   "--shape-weights", "weights/shape-small",
-                   "--seed", str(seed)]
-            if steps is not None:
-                cmd += ["--steps", str(steps)]
-            if guidance is not None:
-                cmd += ["--guidance", str(guidance)]
-            if octree is not None:
-                cmd += ["--octree", str(octree)]
+            # Shape-only is a separate subcommand, not a dropped flag: the
+            # binary's `generate` requires --paint-weights unconditionally,
+            # and `shape` names the shape checkpoint --weights instead of
+            # --shape-weights. The shared knobs below apply to both.
             if paint:
-                cmd += ["--paint-weights", "weights/paint-large",
-                        "--paint-model", "pbr", "--tex", str(texture_size)]
+                cmd = [str(BINARY), "generate", str(gen_input), "-o", str(dst),
+                       "--shape-weights", "weights/shape-small",
+                       "--paint-weights", "weights/paint-large",
+                       "--paint-model", "pbr", "--tex", str(texture_size)]
                 if paint_steps is not None:
                     cmd += ["--paint-steps", str(paint_steps)]
                 if paint_res is not None:
                     cmd += ["--res", str(paint_res)]
                 if not superres:
                     cmd.append("--no-superres")
+            else:
+                cmd = [str(BINARY), "shape", str(gen_input), "-o", str(dst),
+                       "--weights", "weights/shape-small"]
+            cmd += ["--seed", str(seed)]
+            if steps is not None:
+                cmd += ["--steps", str(steps)]
+            if guidance is not None:
+                cmd += ["--guidance", str(guidance)]
+            if octree is not None:
+                cmd += ["--octree", str(octree)]
             env = os.environ | {"METAL_PATH": str(METALLIB_DIR),
                                 "MLX_METAL_PATH": str(METALLIB_DIR)}
-            proc = subprocess.run(cmd, cwd=HY3D_REPO, env=env,
-                                  capture_output=True, text=True,
-                                  timeout=GENERATE_TIMEOUT)
-            if proc.returncode != 0 and "--seed" in " ".join(
-                    (proc.stderr or "")[-500:].lower().split()):
+            rc, so, se, streamed = await _run_engine(cmd, env, ctx, paint)
+            if rc != 0 and "--seed" in " ".join(se[-500:].lower().split()):
                 # Older builds without a seed flag: drop it and retry once.
                 cmd = [c for i, c in enumerate(cmd)
                        if c != "--seed" and cmd[i - 1] != "--seed"]
-                proc = subprocess.run(cmd, cwd=HY3D_REPO, env=env,
-                                      capture_output=True, text=True,
-                                      timeout=GENERATE_TIMEOUT)
-            if proc.returncode != 0 or not dst.is_file():
+                rc, so, se, streamed = await _run_engine(cmd, env, ctx, paint)
+            if rc != 0 or not dst.is_file():
                 _record_job("generate_model", src.name, False,
                             time.monotonic() - started)
-                raise RuntimeError(
-                    "hy3d generate failed (exit %d):\n%s"
-                    % (proc.returncode, (proc.stderr or proc.stdout)[-2000:]))
+                raise RuntimeError("hy3d %s failed (exit %d):\n%s"
+                                   % (cmd[1], rc, (se or so)[-2000:]))
             stages.append("shape+paint" if paint else "shape")
 
             verts = faces = None
-            m = re.search(r"([\d,]+)\s*vert", proc.stdout, re.I)
+            m = re.search(r"([\d,]+)\s*vert", so, re.I)
             if m:
                 verts = int(m.group(1).replace(",", ""))
-            m = re.search(r"([\d,]+)\s*(?:faces|tris|triangles)", proc.stdout, re.I)
+            m = re.search(r"([\d,]+)\s*(?:faces|tris|triangles)", so, re.I)
             if m:
                 faces = int(m.group(1).replace(",", ""))
 
             if finish:
-                fin = _run_worker("finish.py", [str(dst), str(dst)])
+                fin = await asyncio.to_thread(
+                    _run_worker, "finish.py", [str(dst), str(dst)])
                 stages.append("finish (%.1f%% accents)"
                               % fin["accent_coverage_pct"])
+
+            if normals:
+                # Last: finish.py round-trips through trimesh, which would
+                # drop the attribute again if it were injected before.
+                nrm = await asyncio.to_thread(_add_normals, dst)
+                if nrm.get("normals_added"):
+                    stages.append("normals (%d)" % nrm["count"])
+                elif nrm.get("warning"):
+                    warning = nrm["warning"]
     finally:
         with _queue_guard:
             _queue_depth -= 1
 
     seconds = time.monotonic() - started
     _record_job("generate_model", src.name, True, seconds)
-    return {"glb_path": str(dst), "verts": verts, "faces": faces,
-            "seconds": round(seconds, 1), "stages": stages}
+    out = {"glb_path": str(dst), "verts": verts, "faces": faces,
+           "seconds": round(seconds, 1), "stages": stages,
+           "progress": "streamed" if streamed else "unavailable"}
+    if warning:
+        out["warning"] = warning
+    return out
 
 
 @mcp.tool
@@ -282,6 +446,7 @@ def finish_model(
     accent_emissive: bool = True,
     seam_pinstripes: float = 0.58,
     seam_halo: float = 0.10,
+    normals: bool = True,
 ) -> dict:
     """Apply the game-look texture pass to a generated GLB. Geometry untouched.
 
@@ -290,6 +455,14 @@ def finish_model(
     Separated from generation so it can be re-run with new knobs without
     regenerating. seam_pinstripes 0-1 (0 disables); defaults are the values
     proven on the AEGIS fleet.
+
+    The accent extractor keys on saturated red-dominant regions and is tuned
+    for broad accent panels — a hard-surface subject whose only accents are
+    thin indicator strips will report accent_coverage_pct near 0. That is
+    the extractor's range, not a mis-specified concept.
+    normals=True re-injects the glTF NORMAL attribute after the texture
+    rewrite, which would otherwise drop it. Geometry is still untouched:
+    normals are derived from the vertex positions already in the file.
     """
     src = Path(glb_path).expanduser()
     if not src.is_file():
@@ -305,6 +478,12 @@ def finish_model(
         argv.append("--no-accent-emissive")
     started = time.monotonic()
     out = _run_worker("finish.py", argv)
+    if normals:
+        # After finish.py, not before: its trimesh round-trip drops NORMAL.
+        nrm = _add_normals(dst)
+        out["normals_added"] = bool(nrm.get("normals_added"))
+        if nrm.get("warning"):
+            out["warning"] = nrm["warning"]
     _record_job("finish_model", src.name, True, time.monotonic() - started)
     return out
 
@@ -314,18 +493,41 @@ def render_preview(glb_path: str, views: list[str] | None = None,
                    size: int = 1024) -> dict:
     """Offscreen renders of a GLB, no engine needed.
 
-    views: subset of iso/front/back/top/side (default [iso]). Needs pyrender
-    in the worker venv; the error message says how to add it if missing.
+    views: subset of iso/front/back/top/side (default [iso]).
+
+    Rasterising needs pyrender, which despite the "offscreen" name still
+    wants a window-server connection — from a daemonised MCP server there
+    often isn't one. When it fails for any reason this falls back to the
+    contact sheets the paint pass wrote beside the GLB and says so in
+    `source`, since those are fixed views, not the ones requested. Only the
+    paint pass writes them, so shape-only output has no fallback.
     """
     src = Path(glb_path).expanduser()
     if not src.is_file():
         raise ValueError("GLB not found: %s" % src)
     outdir = HY3D_OUT / "previews"
     started = time.monotonic()
-    out = _run_worker("preview.py", [
-        str(src), str(outdir),
-        "--views", ",".join(views or ["iso"]),
-        "--size", str(size)])
+    try:
+        out = _run_worker("preview.py", [
+            str(src), str(outdir),
+            "--views", ",".join(views or ["iso"]),
+            "--size", str(size)])
+        out["source"] = "rendered"
+    except RuntimeError as e:
+        # Sibling sheets keep the full GLB filename: foo.glb.views.png.
+        sheets = [p for p in (Path(str(src) + ".views.png"),
+                              Path(str(src) + ".rendercheck.png")) if p.is_file()]
+        reason = str(e).strip().splitlines()[-1]
+        if not sheets:
+            raise RuntimeError(
+                "%s — and no generator sheets beside %s to fall back on "
+                "(only the paint pass writes those, so shape-only output has "
+                "none)" % (e, src.name))
+        out = {"png_paths": [str(p) for p in sheets],
+               "source": "generator_sheets",
+               "note": "could not rasterise (%s); these are the multiview and "
+                       "render-check sheets written beside the GLB during "
+                       "paint, not the views requested" % reason}
     _record_job("render_preview", src.name, True, time.monotonic() - started)
     return out
 
@@ -377,10 +579,12 @@ def _server_status() -> dict:
 
     venv_ok = False
     venv_fix = ("worker venv missing: run the setup_engine tool, or set "
-                "HY3D_PY to a python with cv2/numpy/trimesh/PIL/scipy")
+                "HY3D_PY to a python with cv2/numpy/trimesh/PIL/scipy/"
+                "pygltflib")
     if HY3D_PY.is_file():
         probe = subprocess.run(
-            [str(HY3D_PY), "-c", "import cv2, numpy, trimesh, PIL, scipy"],
+            [str(HY3D_PY), "-c",
+             "import cv2, numpy, trimesh, PIL, scipy, pygltflib"],
             capture_output=True, text=True, timeout=60.0)
         venv_ok = probe.returncode == 0
         if not venv_ok:
@@ -388,8 +592,8 @@ def _server_status() -> dict:
             # the pip form fails with "No module named pip" on a stock setup.
             venv_fix = ("worker venv at %s is missing packages: %s — install "
                         "them with `uv pip install --python %s opencv-python "
-                        "numpy trimesh pillow scipy`, or run the setup_engine "
-                        "tool"
+                        "numpy trimesh pillow scipy pygltflib`, or run the "
+                        "setup_engine tool"
                         % (HY3D_PY, probe.stderr.strip()[-300:], HY3D_PY))
 
     return {
@@ -399,6 +603,26 @@ def _server_status() -> dict:
         "config": {"HY3D_REPO": str(HY3D_REPO), "HY3D_PY": str(HY3D_PY),
                    "HY3D_OUT": str(HY3D_OUT)},
     }
+
+
+@mcp.tool
+async def cancel_job() -> dict:
+    """Kill the generation currently running and free the queue.
+
+    For when a client has stopped waiting but the engine has not stopped
+    working — a job abandoned that way holds the single-job queue and the
+    GPU, and every later call blocks behind it. Safe to call when nothing
+    is running; it just reports that.
+    """
+    proc = _current_proc
+    if proc is None or proc.returncode is not None:
+        return {"killed": False, "note": "no engine process is running",
+                "queue_depth": _queue_depth}
+    pid = proc.pid
+    proc.kill()
+    return {"killed": True, "pid": pid,
+            "note": "engine killed; the call that started it will return an "
+                    "error, and the queue frees once it unwinds"}
 
 
 @mcp.tool
@@ -413,7 +637,7 @@ def server_status() -> dict:
 
 
 @mcp.tool
-def setup_engine(
+async def setup_engine(
     confirm: bool = False,
     only: int | None = None,
     repo: str | None = None,
@@ -449,9 +673,10 @@ def setup_engine(
     with _queue_guard:
         _queue_depth += 1
     try:
-        with _job_lock:
-            proc = subprocess.run(["/bin/bash"] + argv, capture_output=True,
-                                  text=True, timeout=SETUP_TIMEOUT)
+        async with _job_lock:
+            proc = await asyncio.to_thread(
+                subprocess.run, ["/bin/bash"] + argv, capture_output=True,
+                text=True, timeout=SETUP_TIMEOUT)
     finally:
         with _queue_guard:
             _queue_depth -= 1

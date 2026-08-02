@@ -137,7 +137,7 @@ cd ../..
 # 7. worker venv — uv, not pip: uv-created venvs have no pip in them
 uv venv ~/.hy3d/worker-venv
 uv pip install --python ~/.hy3d/worker-venv/bin/python \
-  opencv-python numpy trimesh pillow scipy pyrender
+  opencv-python numpy trimesh pillow scipy pyrender pygltflib
 ```
 
 Then set `HY3D_REPO=~/git/repos/hunyuan3d-mlx` and
@@ -174,12 +174,54 @@ what a by-the-book install of the upstream repo gets wrong, and what
 | `generate_model` | image → textured GLB (auto cutout, optional finish) | ~3–4 min (shape only: ~20s) |
 | `prepare_concept` | plain-background image → centered square RGBA | seconds |
 | `finish_model` | game-look texture pass: toned albedo + accent/seam emissive | seconds |
-| `render_preview` | offscreen PNG renders (iso/front/back/top/side) | seconds |
+| `render_preview` | offscreen PNG renders, falling back to the generator's own sheets | seconds |
 | `server_status` | full setup diagnostic, queue depth, last job | instant |
 | `setup_engine` | runs `install.sh`; dry run unless `confirm=true` | instant (plan) / up to an hour (apply) |
+| `cancel_job` | kill the running engine and free the queue | instant |
 
 Generation is serialized — one job at a time; concurrent calls queue
-rather than OOM the machine.
+rather than OOM the machine. `generate_model` streams MCP progress
+notifications the whole way through, so a slow job stays distinguishable
+from a hung one, and cancelling the call kills the engine process rather
+than leaving it holding the queue.
+
+## Notes from production use
+
+- **Outputs carry vertex normals.** The engine writes only `POSITION` and
+  `TEXCOORD_0`; Godot does not synthesise the rest, and lights the whole
+  mesh off one constant vector when `NORMAL` is missing — which presents
+  as a bad material, not a missing attribute, and is expensive to
+  diagnose. `generate_model` and `finish_model` inject it by default
+  (`normals=false` opts out). Injected, not re-exported: a round trip
+  through a mesh library rebuilds the material block and destroys the
+  emissive map the finish pass writes.
+- **Previews degrade rather than fail.** pyrender wants a window-server
+  connection despite the "offscreen" name, and a daemonised MCP server
+  usually has none. When rasterising fails, `render_preview` returns the
+  `<name>.glb.views.png` and `.rendercheck.png` contact sheets the paint
+  pass writes beside every GLB, and marks `source: "generator_sheets"` so
+  you know they're fixed views, not the ones you asked for. Shape-only
+  output has no sheets to fall back on.
+- **`octree` costs scale with concept detail, not just the number.** A
+  smooth-hulled subject at `octree=384` finished in ~6 minutes; a
+  lattice/greeble-heavy one ran 16.5 minutes and pushed the machine deep
+  into swap — and at defaults that same subject resolved its truss braces
+  fine in 790s. Reach for `octree` when thin struts *fuse together*, not
+  as a general quality dial.
+- **Vertex counts vary ~4.5× across subjects at identical settings**
+  (82k for a gun housing, 367k for a trussed deck). There is no knob that
+  trades detail back down; budget for the heavy case, or simplify the
+  concept.
+- **`accent_coverage_pct` near 0 is usually the extractor's range, not
+  your concept.** It keys on saturated red-dominant regions and is tuned
+  for broad accent panels; thin indicator strips score near zero.
+- **Long jobs and client timeouts.** A detailed concept can legitimately
+  paint for 13+ minutes, which exceeds some clients' idle-abort defaults.
+  The progress stream is what keeps those timers alive; if your client
+  still gives up, raise its tool timeout (Claude Code:
+  `CLAUDE_CODE_MCP_TOOL_IDLE_TIMEOUT`, or a per-server `timeout` in MCP
+  settings). If a job is ever abandoned mid-flight, `cancel_job` frees
+  the queue without hunting for a pid.
 
 ## Input doctrine
 
