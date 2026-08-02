@@ -117,7 +117,11 @@ and keep the seed fixed so you can attribute the difference.
   heavy subject took 16.5 and drove the machine into swap, having already
   resolved its truss braces fine at the default. Vertex count grows
   roughly cubically and meshes are already ~70-80k at the default, with
-  ~4.5× spread across subjects at identical settings.
+  ~4.5× spread across subjects at identical settings. Those are
+  shape-stage figures; a painted model reports higher because the texture
+  pass splits vertices along UV seams — one turret left the shape stage at
+  63.5k and reached disk at 91k. Triangle count is unaffected, so size
+  LODs off `faces`, not `verts`.
 - `paint_res` (512) — resolution the multiview texture diffusion runs at.
   The strongest texture-sharpness lever, and the one to reach for when
   fine surface markings smear.

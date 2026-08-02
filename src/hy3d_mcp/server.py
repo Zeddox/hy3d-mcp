@@ -227,6 +227,18 @@ def _add_normals(glb: Path) -> dict:
         return {"normals_added": False, "warning": "normals pass failed: %s" % e}
 
 
+def _mesh_counts(glb: Path) -> dict:
+    """Read vertex and triangle counts off a finished GLB.
+
+    Never raises, for the same reason as _add_normals: a reporting detail is
+    not worth failing a completed bake over.
+    """
+    try:
+        return _run_worker("meshinfo.py", [str(glb)])
+    except Exception:
+        return {}
+
+
 def _out_path(stem: str, suffix: str, explicit: str | None) -> Path:
     if explicit:
         p = Path(explicit).expanduser()
@@ -397,6 +409,15 @@ async def generate_model(
                     stages.append("normals (%d)" % nrm["count"])
                 elif nrm.get("warning"):
                     warning = nrm["warning"]
+
+            # The counts above came from the engine's own line, which describes
+            # the shape stage. Paint re-parameterises the mesh and splits
+            # vertices along UV seams, so that line understates what actually
+            # reached disk. Read the file instead, and keep the parsed values
+            # as a fallback so this can never return null.
+            info = await asyncio.to_thread(_mesh_counts, dst)
+            if info.get("verts") is not None:
+                verts, faces = info["verts"], info["faces"]
     finally:
         with _queue_guard:
             _queue_depth -= 1
