@@ -34,19 +34,38 @@ image-generation tool is available in the session (e.g. a Gemini or other
 image-gen MCP). If none is available, ask the user for an image — do not
 try to proceed without one.
 
-The concept image makes or breaks the model. Compose the image prompt
-from the user's description plus ALL of these constraints:
+The concept image makes or breaks the model, and it is the single biggest
+lever on output quality — bigger than any generator knob. Measured on one
+subject at identical seed and defaults, a clean evenly-lit input produced
+**31% more geometry** (101k vs 77k verts) and visibly crisper panel and
+edge detail than the painted concept art of the same object. Spend effort
+here before reaching for `octree`.
+
+Compose the image prompt from the user's description plus ALL of these:
 
 - **single object**, whole object in frame, roughly centered
 - **three-quarter view** (shows front and side; best geometry recovery)
-- **plain, uniform light-gray background** — nothing else in frame
-- **naturally lit** — normal soft studio lighting. Never request "flat
-  lighting", "unlit", or "albedo style": the generator de-lights
-  internally, and pre-flattened input bakes pale and featureless.
+- **plain, uniform light-gray background** — nothing else in frame, and a
+  flat single tone rather than a gradient or vignette. The cutout keys on
+  corner colour, so hard figure/ground separation matters.
+- **even, soft, neutral studio lighting.** Ask for "soft even studio
+  lighting, neutral white". Avoid dramatic, moody, rim-lit, golden-hour
+  or single-hard-key looks: baked-in directional shading and blown
+  highlights are reconstructed as surface relief that isn't there.
+  But never request "flat lighting", "unlit", or "albedo style" either —
+  the generator de-lights internally, and pre-flattened input bakes pale
+  and featureless. Even and soft, not absent.
 - **no drop shadow, no contact shadow** — shadows under the object are
   reconstructed as literal geometry. Say "floating, no shadow" in the
   prompt.
 - no text, watermark, or frame
+
+**Then look at what came back before generating.** Image generators
+routinely ignore the shadow instruction, and a soft contact shadow is easy
+to miss against a gray background. Check for it explicitly, along with a
+background gradient or a hard key light. Regenerating a concept costs
+seconds; a bad concept costs a 4-minute paint pass and still has to be
+redone. This is worth one deliberate look, not a glance.
 
 Show the concept to the user before spending generation time, unless they
 asked you to just go ahead.
@@ -124,10 +143,18 @@ Check `source` in the reply. `"rendered"` means you got the views you
 asked for. `"generator_sheets"` means rasterising failed — usually no
 window server from a daemonised MCP process — and you are looking at the
 multiview and render-check contact sheets the paint pass wrote beside the
-GLB instead. Those are perfectly good for judging a result; just say so
-rather than describing them as the requested angles. Only shape-only
-output has no sheets, and there the call errors outright — the GLB is
-still fine.
+GLB instead. Say so rather than describing them as the requested angles.
+Only shape-only output has no sheets, and there the call errors outright —
+the GLB is still fine.
+
+**Do not judge geometry from the sheets.** They are small, heavily
+foreshortened, and good only for confirming the paint pass ran. Reading
+them as if they were renders has produced confident, entirely false defect
+reports — a base ring that looked like a flat slab and a rear assembly
+that looked fused both turned out sharp and correct at full
+`render_preview` resolution. If `source` is `"generator_sheets"`, you do
+not yet know whether the mesh is good; say that plainly instead of
+assessing shape from them.
 
 Report the `glb_path` plainly. If the user works in a game engine,
 importing is their engine's job (Godot: copy into the project, then
@@ -137,9 +164,14 @@ importing is their engine's job (Godot: copy into the project, then
 
 - Wrong shape → change the concept image, not the generator knobs. The
   mesh follows the picture.
-- Right shape but soft or fused detail → that is the one case the
-  fidelity knobs above address; raise `octree` for geometry, `paint_res`
-  for texture.
+- Soft or mushy detail → check the concept **first**, before touching
+  `octree`. Dramatic lighting, a background gradient, or a surviving
+  shadow cost more detail than a resolution step buys, and a regenerated
+  concept is seconds against minutes. Only once the concept is clean and
+  evenly lit is this the case the fidelity knobs address — `octree` for
+  geometry, `paint_res` for texture.
+- Detail that looks fused in a contact sheet → re-check with
+  `render_preview` before believing it. See Step 3.
 - Pale/washed-out texture → the concept was too flat-lit; regenerate it
   naturally lit.
 - Phantom pancake of geometry under the model → a shadow survived in the
