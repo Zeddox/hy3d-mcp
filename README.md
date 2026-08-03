@@ -239,6 +239,20 @@ than leaving it holding the queue.
 - No mesh post-processing (decimation/repair proved destructive on
   generated meshes; LODs belong to your engine's importer).
 - No batch tool — loop `generate_model`; the queue serializes.
+- No multiview input **yet** — the pipeline is single-image at every entry
+  point. Investigated and specced, not built; see below.
+
+## Investigations
+
+- [`docs/multiview-routes-2026-08-02.md`](docs/multiview-routes-2026-08-02.md)
+  — multi-image → 3D. Three routes costed (native MLX port, ComfyUI hybrid,
+  upstream PR), six open questions, and a Phase 0 A/B that settles whether
+  multiview earns its keep before anything is built. **Tabled, decision open.**
+- [`docs/multiview-findings-2026-08-02.md`](docs/multiview-findings-2026-08-02.md)
+  — the investigation behind it. Read this for why contact sheets must never
+  be fed back in, why generator sheets must never be used to judge geometry,
+  and the measurement showing +31% geometry from input quality alone.
+- [`docs/field-report-2026-08-01.md`](docs/field-report-2026-08-01.md)
 
 ## License
 

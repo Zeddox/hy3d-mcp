@@ -151,3 +151,14 @@ generated elsewhere (ComfyUI multiview, a blockout, a downloaded model) be
 textured by the working MLX paint stage, sidestepping the missing CUDA
 rasterizer. Worth exposing as a `paint_mesh` tool if the multiview path is
 ever pursued.
+
+## Follow-up
+
+Shipped as the `paint_mesh` tool in v0.4.0, later the same day.
+
+Section 5's assumption that a native MLX multiview port is out of reach did not
+survive a config diff: `hunyuan3d-dit-v2-mv` matches the checkpoint we already
+run on every structural hyperparameter, differing only in loop counts, a scale
+factor, and two image-encoder classes. Routes, costs and the open questions are
+specced in [`multiview-routes-2026-08-02.md`](multiview-routes-2026-08-02.md).
+Findings 2, 3 and 4 above are unaffected.
