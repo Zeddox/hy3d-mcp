@@ -172,6 +172,7 @@ what a by-the-book install of the upstream repo gets wrong, and what
 | Tool | What it does | Typical time |
 | --- | --- | --- |
 | `generate_model` | image → textured GLB (auto cutout, optional finish) | ~3–4 min (shape only: ~20s) |
+| `paint_mesh` | texture a mesh you already have, from a concept image | ~3 min |
 | `prepare_concept` | plain-background image → centered square RGBA | seconds |
 | `finish_model` | game-look texture pass: toned albedo + accent/seam emissive | seconds |
 | `render_preview` | offscreen PNG renders, falling back to the generator's own sheets | seconds |

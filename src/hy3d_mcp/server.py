@@ -119,7 +119,8 @@ def _mmss(seconds: float) -> str:
 
 
 async def _run_engine(cmd: list[str], env: dict[str, str], ctx: Context | None,
-                      two_stage: bool) -> tuple[int, str, str, bool]:
+                      two_stage: bool,
+                      stage: str = "shape") -> tuple[int, str, str, bool]:
     """Run the hy3d binary, relaying its progress to the MCP client.
 
     Returns (returncode, stdout, stderr, streamed). Two things a plain
@@ -140,7 +141,7 @@ async def _run_engine(cmd: list[str], env: dict[str, str], ctx: Context | None,
     # In a two-stage generate, shape owns the first half of the bar and paint
     # the second; the shape subcommand alone owns all of it.
     state = {"base": 0.0, "width": 50.0 if two_stage else 100.0,
-             "last": 0.0, "stage": "shape"}
+             "last": 0.0, "stage": stage}
     out: list[str] = []
     err: list[str] = []
     started = time.monotonic()
@@ -426,6 +427,158 @@ async def generate_model(
     _record_job("generate_model", src.name, True, seconds)
     out = {"glb_path": str(dst), "verts": verts, "faces": faces,
            "seconds": round(seconds, 1), "stages": stages,
+           "progress": "streamed" if streamed else "unavailable"}
+    if warning:
+        out["warning"] = warning
+    return out
+
+
+@mcp.tool
+async def paint_mesh(
+    mesh_path: str,
+    image_path: str,
+    output_path: str | None = None,
+    texture_size: int = 2048,
+    paint_res: int | None = None,
+    paint_steps: int | None = None,
+    superres: bool = True,
+    auto_cutout: bool = True,
+    finish: bool = False,
+    normals: bool = True,
+    ctx: Context | None = None,
+) -> dict:
+    """Texture an existing mesh from a concept image. Geometry untouched.
+
+    The paint half of generate_model, reachable on its own: it takes a mesh
+    you already have and bakes a PBR texture onto it. Two things that buys —
+    re-texturing at different knobs without paying for the shape pass again,
+    and texturing geometry this engine did not produce (a blockout, a
+    multiview reconstruction, anything the modeller hands you).
+
+    mesh_path: .glb, .gltf and .obj are loaded directly; anything else goes
+    through ModelIO and may or may not work, so it is reported as a warning
+    rather than refused.
+    image_path: the conditioning image, under the same rules as
+    generate_model — single object, three-quarter view, evenly lit, plain
+    background. It drives the texture only; it cannot move a vertex, so a
+    mismatch against the mesh shows up as smeared projection.
+    auto_cutout keys out a plain background first unless the image already
+    carries real transparency. Leave it on: the paint pipeline composites
+    alpha over white but does no keying of its own, so an unkeyed gray
+    backdrop is conditioning the texture rather than being ignored.
+    finish=True applies the game-look pass afterwards (see finish_model).
+    Blocks while an earlier job is running (single-job queue).
+
+    No seed: the paint pipeline re-seeds to 0 internally, so the same mesh
+    and image reproduce the same texture. Re-running is free of variance,
+    and rerolling is not an option the way it is on shape.
+
+    Knobs, each defaulting to None so the binary's own default (in parens)
+    applies:
+
+      paint_res (512)   resolution the multiview texture diffusion runs
+                        at — the sharpness lever.
+      paint_steps (15)  texture diffusion steps.
+
+    texture_size: 512|1024|2048|4096. The engine's own pbr default is 4096;
+    2048 here matches generate_model and keeps peak memory modest.
+    superres=False skips the texture super-resolution pass.
+    """
+    global _queue_depth
+    mesh = Path(mesh_path).expanduser()
+    src = Path(image_path).expanduser()
+    if not mesh.is_file():
+        raise ValueError("mesh not found: %s" % mesh)
+    if not src.is_file():
+        raise ValueError("input image not found: %s" % src)
+    try:
+        with Image.open(src) as im:
+            im.verify()
+    except Exception as e:
+        raise ValueError("input is not a readable image: %s (%s)" % (src, e))
+    if texture_size not in (512, 1024, 2048, 4096):
+        raise ValueError("texture_size must be 512, 1024, 2048 or 4096")
+    for name, val in (("paint_res", paint_res), ("paint_steps", paint_steps)):
+        if val is not None and val < 1:
+            raise ValueError("%s must be a positive integer" % name)
+
+    dst = _out_path(mesh.stem + "-painted", ".glb", output_path)
+    if dst.resolve() == mesh.resolve():
+        raise ValueError("output would overwrite the input mesh (%s) — the "
+                         "engine reads it while writing, so give a different "
+                         "output_path" % dst)
+
+    stages: list[str] = []
+    warning: str | None = None
+    if mesh.suffix.lower() not in (".glb", ".gltf", ".obj"):
+        warning = ("%s is outside the formats the engine loads directly "
+                   "(.glb/.gltf/.obj); it falls back to ModelIO, which may "
+                   "not handle it" % (mesh.suffix or "a missing extension"))
+    started = time.monotonic()
+    with _queue_guard:
+        _queue_depth += 1
+    try:
+        async with _job_lock:
+            gen_input = src
+            if auto_cutout and not _has_real_alpha(src):
+                rgba = HY3D_OUT / "intermediate" / (src.stem + "-rgba.png")
+                cut = await asyncio.to_thread(
+                    _run_worker, "cutout.py", [str(src), str(rgba)])
+                gen_input = Path(cut["png_path"])
+                stages.append("cutout (%.1f%% opaque)" % cut["opaque_pct"])
+
+            # The paint subcommand names its flags differently from generate:
+            # --weights (the paint root, not the checkpoint), --model, and
+            # --steps, which here means paint steps — on generate that same
+            # flag is the shape steps.
+            cmd = [str(BINARY), "paint", str(mesh), str(gen_input),
+                   "-o", str(dst),
+                   "--weights", "weights/paint-large",
+                   "--model", "pbr", "--tex", str(texture_size)]
+            if paint_steps is not None:
+                cmd += ["--steps", str(paint_steps)]
+            if paint_res is not None:
+                cmd += ["--res", str(paint_res)]
+            if not superres:
+                cmd.append("--no-superres")
+            env = os.environ | {"METAL_PATH": str(METALLIB_DIR),
+                                "MLX_METAL_PATH": str(METALLIB_DIR)}
+            rc, so, se, streamed = await _run_engine(
+                cmd, env, ctx, False, stage="paint")
+            if rc != 0 or not dst.is_file():
+                _record_job("paint_mesh", mesh.name, False,
+                            time.monotonic() - started)
+                raise RuntimeError("hy3d paint failed (exit %d):\n%s"
+                                   % (rc, (se or so)[-2000:]))
+            stages.append("paint")
+
+            if finish:
+                fin = await asyncio.to_thread(
+                    _run_worker, "finish.py", [str(dst), str(dst)])
+                stages.append("finish (%.1f%% accents)"
+                              % fin["accent_coverage_pct"])
+
+            if normals:
+                # Last: finish.py round-trips through trimesh, which would
+                # drop the attribute again if it were injected before.
+                nrm = await asyncio.to_thread(_add_normals, dst)
+                if nrm.get("normals_added"):
+                    stages.append("normals (%d)" % nrm["count"])
+                elif nrm.get("warning"):
+                    warning = nrm["warning"]
+
+            # Paint prints no vert/face line at all, so unlike generate_model
+            # there is nothing to parse and the file is the only source.
+            info = await asyncio.to_thread(_mesh_counts, dst)
+    finally:
+        with _queue_guard:
+            _queue_depth -= 1
+
+    seconds = time.monotonic() - started
+    _record_job("paint_mesh", mesh.name, True, seconds)
+    out = {"glb_path": str(dst), "verts": info.get("verts"),
+           "faces": info.get("faces"), "seconds": round(seconds, 1),
+           "stages": stages,
            "progress": "streamed" if streamed else "unavailable"}
     if warning:
         out["warning"] = warning

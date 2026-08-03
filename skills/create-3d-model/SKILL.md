@@ -164,6 +164,38 @@ Report the `glb_path` plainly. If the user works in a game engine,
 importing is their engine's job (Godot: copy into the project, then
 `godot --headless --import`).
 
+## Texturing a mesh you already have
+
+`paint_mesh` runs the paint half on its own — an existing mesh plus a
+concept image in, a textured GLB out, geometry untouched. Two uses:
+re-texturing at different knobs without paying for the shape pass again,
+and texturing geometry this engine did not make (a blockout, a sculpt, a
+reconstruction from somewhere else). `.glb`, `.gltf` and `.obj` load
+directly; anything else falls back to ModelIO and is flagged as a warning
+rather than refused.
+
+The conditioning image follows the same rules as Step 1, and `auto_cutout`
+matters more here than it looks: the paint pipeline composites existing
+alpha over white but does no background keying of its own, so an unkeyed
+backdrop ends up conditioning the texture instead of being ignored.
+
+There is no `seed`. The paint pipeline re-seeds to 0 internally, so the
+same mesh and image always produce the same texture — rerolling is not
+available the way it is on shape. Change the image or the knobs instead.
+
+The image cannot move a vertex. Where it disagrees with the mesh you get
+smeared projection, not corrected geometry.
+
+Paint dominates the pipeline's runtime, so what this saves is the shape
+pass — tens of seconds — not most of the wait. Reach for it because you
+have geometry that needs texturing, not to go faster.
+
+Progress on this call is heartbeat only. The paint subcommand does not emit
+the percentage lines `generate` does, so the bar creeps toward its ceiling
+on elapsed time rather than tracking real completion — a run sitting at
+~43% after three minutes is normal, not stalled. The elapsed time in the
+message is the honest part.
+
 ## Iterating
 
 - Wrong shape → change the concept image, not the generator knobs. The
