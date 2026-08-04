@@ -45,9 +45,16 @@ Compose the image prompt from the user's description plus ALL of these:
 
 - **single object**, whole object in frame, roughly centered
 - **three-quarter view** (shows front and side; best geometry recovery)
-- **plain, uniform light-gray background** — nothing else in frame, and a
-  flat single tone rather than a gradient or vignette. The cutout keys on
-  corner colour, so hard figure/ground separation matters.
+- **plain, uniform background** — nothing else in frame, and a flat single
+  tone rather than a gradient or vignette. The cutout keys on corner
+  colour, so hard figure/ground separation matters. Light gray is the
+  default. When the subject has no white or near-white parts, **pure white
+  with product-cutout framing** ("isolated on seamless white, catalog
+  product cutout") is worth trying — it came back clean once where two
+  gray-background attempts kept a contact shadow through increasingly
+  emphatic negative prompting. That is a single sample, and it changed the
+  background colour and the framing language together, so which part did
+  the work is unknown.
 - **even, soft, neutral studio lighting.** Ask for "soft even studio
   lighting, neutral white". Avoid dramatic, moody, rim-lit, golden-hour
   or single-hard-key looks: baked-in directional shading and blown
@@ -66,6 +73,18 @@ to miss against a gray background. Check for it explicitly, along with a
 background gradient or a hard key light. Regenerating a concept costs
 seconds; a bad concept costs a 4-minute paint pass and still has to be
 redone. This is worth one deliberate look, not a glance.
+
+**Better than looking: measure the key.** Run `prepare_concept` and check
+the alpha channel of the RGBA it writes, because that — not the source
+image — is what conditions the model. A clean key is almost entirely alpha
+0 or 255 with well under 1% in between.
+
+What the histogram catches is **background non-uniformity**, which is easy
+to miss by eye. One observed gradient-gray background keyed at 36% partial
+alpha and left patches of background gray fully **opaque** — the key had
+smeared rather than separated. A flat white background of the same subject
+keyed at 0.1% partial. Note this measures the background, not the shadow
+specifically; the two were not varied independently.
 
 Show the concept to the user before spending generation time, unless they
 asked you to just go ahead.
@@ -144,8 +163,11 @@ Call `render_preview` on the GLB (default iso view; add
 PNG(s) to the user.
 
 Check `source` in the reply. `"rendered"` means you got the views you
-asked for. `"generator_sheets"` means rasterising failed — usually no
-window server from a daemonised MCP process — and you are looking at the
+asked for. `"generator_sheets"` means rasterising failed — most often a
+worker venv still on the pyopengl 3.1.0 that pyrender pins, which cannot
+render textured meshes; `server_status`'s `preview_ok` says so outright and
+carries the one-line upgrade. Note it only breaks on *textured* meshes, so
+the venv looks healthy until the first painted GLB. You are looking at the
 multiview and render-check contact sheets the paint pass wrote beside the
 GLB instead. Say so rather than describing them as the requested angles.
 Only shape-only output has no sheets, and there the call errors outright —

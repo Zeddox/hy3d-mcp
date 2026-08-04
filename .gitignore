@@ -3,3 +3,7 @@ __pycache__/
 .venv/
 dist/
 *.egg-info/
+
+# Image-gen MCP servers drop their output in the cwd, which is this repo when
+# a session is working here. Concept art belongs in HY3D_OUT, not in the tree.
+generated_imgs/

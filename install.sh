@@ -24,6 +24,28 @@ ENGINE_GIT="https://github.com/ZimengXiong/Hunyuan3D-MLX.git"
 BUILD_REAL_REL=".build/arm64-apple-macosx/release"
 
 WORKER_PKGS=(opencv-python numpy trimesh pillow scipy pyrender pygltflib)
+
+# Every pyrender release pins pyopengl==3.1.0, which uv treats as hard, so this
+# cannot join WORKER_PKGS — resolving the two together is reported unsatisfiable.
+# 3.1.0 predates numpy 2 and its glGenTextures wrapper raises "No array-type
+# handler for type _ctypes.type", which only bites on TEXTURED meshes; an
+# untextured render succeeds and hides it. Every painted GLB hits it. pyrender
+# itself works fine against newer pyopengl, so the pin gets overridden after the
+# fact.
+WORKER_GL_MIN="PyOpenGL>=3.1.7"
+
+WORKER_IMPORT="import cv2, numpy, trimesh, PIL, scipy, pyrender, pygltflib"
+
+# Split from the imports above because the consequences differ: without these
+# packages nothing runs, whereas a stale pyopengl costs only render_preview.
+# Importing pyrender proves nothing on its own — the failure is inside a GL
+# call, so the stale pin passes a plain import and still cannot render. Tested
+# against the same floor the installer applies, so detection and repair cannot
+# drift apart.
+WORKER_GL_CHECK="import OpenGL
+_v = tuple(int(''.join(c for c in p if c.isdigit()) or 0)
+           for p in OpenGL.__version__.split('.')[:3])
+assert _v >= (3, 1, 7), 'pyopengl %s cannot render textured meshes' % OpenGL.__version__"
 SHAPE_HF="zimengxiong/hunyuan3d-mlx-shape-small"
 PAINT_HF="zimengxiong/hunyuan3d-mlx-paint-large"
 
@@ -40,6 +62,8 @@ say()  { printf '%s\n' "$*"; }
 ok()   { printf '  %sok%s      %s\n' "$GRN" "$RST" "$*"; }
 skip() { printf '  %sskip%s    %s\n' "$DIM" "$RST" "$*"; }
 work() { printf '  %srun%s     %s\n' "$YEL" "$RST" "$*"; }
+# Degraded but usable — unlike bad(), leaves FAILED alone so the phase passes.
+warn() { printf '  %swarn%s    %s\n' "$YEL" "$RST" "$*"; }
 bad()  { printf '  %sFAILED%s  %s\n' "$RED" "$RST" "$*"; FAILED=1; }
 phase(){ printf '\n%s[%s/7] %s%s\n' "$DIM" "$1" "$2" "$RST"; }
 
@@ -331,15 +355,18 @@ worker_venv() {
     # the server is actually configured to use; don't build a second one.
     if [ -n "${HY3D_PY:-}" ]; then
         local configured="${HY3D_PY/#\~/$HOME}"
-        if [ -x "$configured" ] && "$configured" -c \
-           "import cv2, numpy, trimesh, PIL, scipy, pyrender, pygltflib" 2>/dev/null; then
+        # The GL floor joins the skip test so a re-run repairs a venv that has
+        # every package but the stale pin — otherwise the phase skips forever.
+        if [ -x "$configured" ] && "$configured" -c "$WORKER_IMPORT" 2>/dev/null \
+           && "$configured" -c "$WORKER_GL_CHECK" 2>/dev/null; then
             skip "HY3D_PY already satisfies every worker package ($configured)"
             WORKER_VENV="$(dirname "$(dirname "$configured")")"
             return 0
         fi
     fi
 
-    if [ -x "$py" ] && "$py" -c "import cv2, numpy, trimesh, PIL, scipy, pyrender, pygltflib" 2>/dev/null; then
+    if [ -x "$py" ] && "$py" -c "$WORKER_IMPORT" 2>/dev/null \
+       && "$py" -c "$WORKER_GL_CHECK" 2>/dev/null; then
         skip "already has every worker package"
         return 0
     fi
@@ -353,7 +380,22 @@ worker_venv() {
     # uv, not pip: uv-created venvs have no pip in them at all.
     uv pip install --python "$py" "${WORKER_PKGS[@]}" >/dev/null 2>&1 \
         || { bad "package install failed — retry with: uv pip install --python $py ${WORKER_PKGS[*]}"; return 1; }
-    "$py" -c "import cv2, numpy, trimesh, PIL, scipy, pyrender, pygltflib" 2>/dev/null \
+
+    # Separate pass on purpose: resolving this alongside pyrender fails, so it
+    # has to land after pyrender has pulled in the 3.1.0 it asks for.
+    work "overriding pyrender's stale pyopengl pin ($WORKER_GL_MIN)"
+    # Not fatal: only render_preview needs this. Generation drives the Swift
+    # binary and the cv2/trimesh workers, none of which touch pyopengl.
+    uv pip install --python "$py" --upgrade "$WORKER_GL_MIN" >/dev/null 2>&1 \
+        || warn "could not upgrade pyopengl — generation is unaffected, but \
+render_preview will fall back to the paint pass's contact sheets on every \
+textured mesh. Retry with: uv pip install --python $py --upgrade $WORKER_GL_MIN"
+
+    "$py" -c "$WORKER_GL_CHECK" 2>/dev/null \
+        && ok "pyopengl clears the render floor ($WORKER_GL_MIN)" \
+        || warn "pyopengl still below $WORKER_GL_MIN — render_preview will use contact sheets"
+
+    "$py" -c "$WORKER_IMPORT" 2>/dev/null \
         && ok "all worker packages import" \
         || bad "packages installed but the import check still fails"
 }

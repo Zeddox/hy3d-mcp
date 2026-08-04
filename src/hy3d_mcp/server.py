@@ -669,12 +669,18 @@ def render_preview(glb_path: str, views: list[str] | None = None,
 
     views: subset of iso/front/back/top/side (default [iso]).
 
-    Rasterising needs pyrender, which despite the "offscreen" name still
-    wants a window-server connection — from a daemonised MCP server there
-    often isn't one. When it fails for any reason this falls back to the
-    contact sheets the paint pass wrote beside the GLB and says so in
-    `source`, since those are fixed views, not the ones requested. Only the
-    paint pass writes them, so shape-only output has no fallback.
+    Rasterising needs pyrender. Its usual failure here is not the window
+    server but pyopengl: every pyrender release pins pyopengl==3.1.0, whose
+    glGenTextures wrapper raises "No array-type handler for type
+    _ctypes.type" against modern numpy. That path is only reached for
+    TEXTURED meshes, so an untextured render succeeds and makes the venv
+    look healthy while every painted GLB fails. install.sh overrides the pin
+    afterwards, and `server_status`'s preview_ok flags a venv still on 3.1.0.
+
+    When it fails for any reason this falls back to the contact sheets the
+    paint pass wrote beside the GLB and says so in `source`, since those are
+    fixed views, not the ones requested. Only the paint pass writes them, so
+    shape-only output has no fallback.
     """
     src = Path(glb_path).expanduser()
     if not src.is_file():
@@ -755,12 +761,22 @@ def _server_status() -> dict:
     venv_fix = ("worker venv missing: run the setup_engine tool, or set "
                 "HY3D_PY to a python with cv2/numpy/trimesh/PIL/scipy/"
                 "pygltflib")
+    preview_ok = False
+    preview_fix = "worker venv missing, so render_preview cannot rasterise"
     if HY3D_PY.is_file():
+        # One probe for both: pyopengl is reported separately from the core
+        # imports so a broken preview never marks generation unhealthy.
         probe = subprocess.run(
             [str(HY3D_PY), "-c",
-             "import cv2, numpy, trimesh, PIL, scipy, pygltflib"],
+             "import cv2, numpy, trimesh, PIL, scipy, pygltflib\n"
+             "print('CORE_OK')\n"
+             "try:\n"
+             "    import pyrender, OpenGL\n"
+             "    print('GL', OpenGL.__version__)\n"
+             "except Exception as e:\n"
+             "    print('GL_ERR', type(e).__name__, e)\n"],
             capture_output=True, text=True, timeout=60.0)
-        venv_ok = probe.returncode == 0
+        venv_ok = "CORE_OK" in probe.stdout
         if not venv_ok:
             # uv, not `python -m pip`: uv-created venvs ship without pip, so
             # the pip form fails with "No module named pip" on a stock setup.
@@ -770,9 +786,36 @@ def _server_status() -> dict:
                         "setup_engine tool"
                         % (HY3D_PY, probe.stderr.strip()[-300:], HY3D_PY))
 
+        gl = next((ln.split(None, 1)[1].strip()
+                   for ln in probe.stdout.splitlines()
+                   if ln.startswith("GL ")), None)
+        # 3.1.0 is what pyrender pins, and its glGenTextures wrapper cannot bind
+        # a texture against modern numpy. Untextured renders still work, so this
+        # is invisible until the first painted GLB. Same floor install.sh
+        # applies, so the diagnostic and the repair cannot disagree.
+        if gl is not None:
+            parts = tuple(int("".join(c for c in p if c.isdigit()) or 0)
+                          for p in gl.split(".")[:3])
+            preview_ok = parts >= (3, 1, 7)
+        if gl is None:
+            preview_fix = ("pyrender/pyopengl not importable under %s, so "
+                           "render_preview falls back to the paint pass's "
+                           "contact sheets — install with `uv pip install "
+                           "--python %s pyrender` then apply the pin override "
+                           "below" % (HY3D_PY, HY3D_PY))
+        elif not preview_ok:
+            preview_fix = ("pyopengl is %s; below 3.1.7 it cannot render "
+                           "textured meshes, so render_preview falls back to "
+                           "contact sheets for every painted GLB (generation "
+                           "is unaffected). Fix with `uv pip install --python "
+                           "%s --upgrade 'PyOpenGL>=3.1.7'` — resolving it "
+                           "alongside pyrender fails, so it must be a separate "
+                           "upgrade" % (gl, HY3D_PY))
+
     return {
         "binary_ok": binary, "metallib_ok": metallib, "weights_ok": weights,
         "layout_ok": layout, "venv_ok": _check(venv_ok, venv_fix),
+        "preview_ok": _check(preview_ok, preview_fix),
         "queue_depth": _queue_depth, "last_job": _last_job,
         "config": {"HY3D_REPO": str(HY3D_REPO), "HY3D_PY": str(HY3D_PY),
                    "HY3D_OUT": str(HY3D_OUT)},
