@@ -132,6 +132,36 @@ Pass `include_normals=True` (or read `mesh.vertex_normals` before exporting).
 Note the shape-only file also has no `TEXCOORD_0`. That is correct — there are
 no UVs without a texture stage. Only a missing `NORMAL` is a defect.
 
+## What the shape stage does and does not give you
+
+It reproduces **silhouette and major forms** well. It does **not** reproduce
+surface relief — carved ornament, panel tracery, engraved detail come out
+smooth, and lit or open panels come out solid.
+
+Raising `octree_resolution` does not recover it. 512 costs roughly 2x the
+wall-clock of 384 and yields no additional relief; it changes tessellation
+density, not what the model represents. Reach for octree when thin struts fuse
+together, not as a detail dial.
+
+Plan for ornament to come from normal or displacement maps in the texture
+step, not from geometry.
+
+Decimation is not optional for a game target: raw output is 0.6-1.0M faces.
+`FaceReducer()(FloaterRemover()(mesh), max_facenum=40000)` takes ~10-16s and
+stayed watertight on every mesh tested.
+
+## Isolating a subject from real concept art
+
+Concept art in the wild is usually a *scene*, not a single object on a plain
+background. A plain-background colour key will correctly refuse such an image;
+`rembg`/u2net handles it, but tends to keep a cast shadow fragment and any
+object touching the subject.
+
+Taking only the **largest connected component** of the alpha mask (dilated a
+few pixels so the anti-aliased rim survives), then cropping to the alpha bbox
+and padding square, cleaned this up reliably. Cast shadows are worth the effort
+to remove: they reconstruct as literal geometry.
+
 ## Input doctrine (unchanged from the MLX build, still true)
 
 Naturally lit concept art; the model de-lights internally, so pre-flattened

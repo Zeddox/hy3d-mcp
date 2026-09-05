@@ -73,6 +73,10 @@ def main():
     ap.add_argument("--cpu-offload", action="store_true",
                     help="conditioner->model->vae sequential offload; the lever "
                          "if peak sits at the VRAM ceiling")
+    ap.add_argument("--max-faces", type=int, default=0,
+                    help="decimate to this face count (0 = off). Raw output is "
+                         "~700k faces, which is not a game-ready mesh. Needs "
+                         "libopengl0 installed or pymeshlab's io plugins fail.")
     ap.add_argument("--flashvdm", action="store_true",
                     help="faster VAE decode path; try only after a baseline run")
     ap.add_argument("--engine", default=os.environ.get(
@@ -151,6 +155,13 @@ def main():
     )[0]
     gen_s = time.time() - t
 
+    raw_faces = int(len(mesh.faces))
+    if args.max_faces:
+        from hy3dgen.shapegen import FaceReducer, FloaterRemover
+        t = time.time()
+        mesh = FaceReducer()(FloaterRemover()(mesh), max_facenum=args.max_faces)
+        print(f"[reduce] {raw_faces} -> {len(mesh.faces)} faces in {time.time()-t:.1f}s")
+
     peak = torch.cuda.max_memory_allocated() / GIB
     # Reserved, not resident, is the spill signal. Resident includes blocks the
     # caching allocator is holding after freeing them, so it drifts up to the
@@ -174,6 +185,7 @@ def main():
         "bytes": out.stat().st_size,
         "vertices": int(len(mesh.vertices)),
         "faces": int(len(mesh.faces)),
+        "raw_faces": raw_faces,
         "watertight": bool(mesh.is_watertight),
         "glb_attributes": glb_attributes(out),
         "load_s": round(load_s, 1),
