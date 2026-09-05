@@ -107,13 +107,15 @@ it fails twice over:
 Both shims are in `scripts/shape_cli.py` behind `--cpu-offload`.
 
 Worth the trouble: on this hardware offload cost **+2% wall-clock** while
-cutting GPU footprint by more than half. It is close to a free lever for
-pushing octree resolution up, not a last resort.
+cutting GPU footprint by more than half, which makes it a practical lever for
+pushing octree resolution up rather than a last resort.
 
-Note that offload changes device placement enough to perturb the result —
-same seed and input gave a slightly different mesh (351,324 vs 350,791
-vertices, and watertight vs not). Treat it as a different configuration for
-reproducibility, not a transparent optimization.
+**It is not, however, output-neutral.** Same seed and input, offload produced
+350,791 vertices and a **non-watertight** mesh where baseline produced 351,324
+and watertight. Baseline is deterministic across runs, so this is offload's
+device placement changing the result, not sampler noise. Watertightness gates
+mesh cleanup, physics and boolean operations downstream, so treat offload as a
+distinct configuration and check the result rather than assuming equivalence.
 
 ## Exporting a GLB Godot can light
 
