@@ -147,8 +147,39 @@ Plan for ornament to come from normal or displacement maps in the texture
 step, not from geometry.
 
 Decimation is not optional for a game target: raw output is 0.6-1.0M faces.
+For 3D printing, prefer a higher budget or the undecimated mesh — 40k faces is
+a game budget, and quadric decimation is tuned to preserve silhouette, not the
+fine surface a print resolves.
 `FaceReducer()(FloaterRemover()(mesh), max_facenum=40000)` takes ~10-16s and
 stayed watertight on every mesh tested.
+
+## Check enclosed volume, not just watertightness
+
+`is_watertight` passes on meshes that are nothing alike. On the same concept
+image, 2.0 and 2mini produced meshes with the same silhouette, the same
+bounding box, both watertight, both single-bodied, both genus 0 — and volumes
+that differed by 5.6x.
+
+2mini had produced a **thin-walled hollow form** rather than a solid: the wall
+wraps around at the bottom, so it is a single closed genus-0 surface enclosing
+a cavity. Horizontal cross-sections tell them apart immediately, where the
+silhouette cannot:
+
+| at mid-body | 2.0 | 2mini |
+|---|---|---|
+| section bounding box | 0.575 x 0.566 | 0.583 x 0.569 |
+| section area | 0.3243 | 0.0249 |
+| **fill of that box** | **99.7%** | **7.5%** |
+| section perimeter | 2.239 | 4.436 |
+
+Renders will not show this — you never see inside a closed mesh. It matters for
+generated collision shapes, for anything boolean, and decisively for 3D
+printing, where it is the difference between a solid model and a shell with
+walls near nozzle width.
+
+Cheap screen: compare `mesh.volume` against `mesh.convex_hull.volume`, or take
+a section and compare its area to its own bounding box. Surface area rising
+while volume falls is the signature.
 
 ## Isolating a subject from real concept art
 
