@@ -40,6 +40,9 @@ def glb_attributes(path):
     Godot does not synthesize normals and lights the whole mesh off one
     constant vector, which presents as a bad material rather than a missing
     attribute. Cheap to check here, expensive to diagnose later.
+
+    Shape-only output legitimately has no TEXCOORD_0 -- there are no UVs
+    without a texture stage. Only a missing NORMAL is a defect.
     """
     try:
         import pygltflib
@@ -114,7 +117,25 @@ def main():
     if args.flashvdm:
         pipe.enable_flashvdm()
     if args.cpu_offload:
+        # Upstream's enable_model_cpu_offload() and _execution_device were
+        # lifted from diffusers' DiffusionPipeline without the base class that
+        # provides `.components`, so both raise AttributeError as shipped.
+        # Supply the mapping ourselves; the keys must match the names in
+        # model_cpu_offload_seq ("conditioner->model->vae").
+        if not hasattr(type(pipe), "components"):
+            type(pipe).components = property(lambda self: {
+                "conditioner": self.conditioner,
+                "model": self.model,
+                "vae": self.vae,
+            })
         pipe.enable_model_cpu_offload()
+        # Second half of the same incomplete lift: enable_model_cpu_offload()
+        # moves the pipeline to CPU, and __call__ then reads `self.device` --
+        # a plain attribute, now "cpu" -- to place latents and timesteps. The
+        # hooked modules still execute on the GPU, so the sampler dies with
+        # "found at least two devices, cuda:0 and cpu". `_execution_device`
+        # exists for exactly this and is never used; restore the attribute.
+        pipe.device = torch.device("cuda")
     load_s = time.time() - t
     after_load = (free0 - torch.cuda.mem_get_info()[0]) / GIB
     print(f"[load] {load_s:.1f}s, {after_load:.2f} GiB resident")
@@ -141,7 +162,12 @@ def main():
 
     out = Path(args.output)
     out.parent.mkdir(parents=True, exist_ok=True)
-    mesh.export(str(out))
+    # include_normals is not cosmetic. trimesh's GLB writer emits NORMAL only
+    # if vertex_normals has been materialized, so a bare export() yields a
+    # POSITION-only file; Godot does not synthesize normals and lights such a
+    # mesh off one constant vector, which reads as a broken material rather
+    # than a missing attribute.
+    mesh.export(str(out), include_normals=True)
 
     stats = {
         "output": str(out),
