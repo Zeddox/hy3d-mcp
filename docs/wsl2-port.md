@@ -284,3 +284,69 @@ Concept `pagoda-clean.png`, defaults, seed 42:
 
 The model reloads on every call — each generation is a fresh subprocess —
 so ~35s of that 185s is fixed overhead per job, not per session.
+
+## Phase 3: what the worker port actually needed
+
+The handoff called this phase "port the worker layer verbatim", and verbatim
+turned out to be right for five of the six. Every worker was exercised under
+the engine venv on this box before anything was changed:
+
+| worker | verdict |
+|---|---|
+| `meshinfo.py` | works unchanged — 20,002 verts / 40,000 faces off accessor metadata |
+| `normals.py` | works unchanged — injected `NORMAL` into a GLB stripped of it, and correctly no-ops on one that has it |
+| `finish.py` | works unchanged on a synthesised textured GLB (49.9% accent coverage). Still unreachable from this build's own output, which has no albedo to tone |
+| `preview.py` | works, five views in 1.3s at 512px — including a *textured* mesh |
+| `tostl.py` | ported in Phase 2 |
+| `cutout.py` | rewritten (below) |
+
+Two findings worth recording.
+
+**The pyopengl trap did not fire, and the check that guards it stays.** The
+macOS installer fought pyrender's `pyopengl==3.1.0` pin, whose
+`glGenTextures` wrapper cannot bind a texture against modern numpy — it
+breaks textured renders only, so an untextured mesh hides it. This venv has
+3.1.10 and renders textured meshes fine. That is not evidence the problem is
+gone; it is evidence this venv was fixed by hand. `server_status`'s
+`preview_ok >= 3.1.7` gate stays exactly as it is, because a fresh provision
+is where pyrender would drag 3.1.0 back in.
+
+**Rendering is software.** EGL comes up as `kms_swrast` under WSL2 (the
+`libEGL warning: NEEDS EXTENSION` line on stderr is this, and is harmless).
+Five 512px views in 1.3s is fast enough that hardware EGL is not worth
+chasing.
+
+### cutout.py: the fallback moved out of the engine
+
+Phase 1 found that the corner-sampling key correctly refuses real concept art
+— a garden scene with three lanterns, rocks, a pond and cast shadows keys at
+corner std 43.0 against a 28.0 ceiling — and that rembg/u2net handles it, but
+keeps a loose rock and part of a shadow. Dropping all but the largest
+connected alpha component fixed both.
+
+That two-step now lives in the worker. `cutout.py` tries the corner key, and
+on refusal falls back to u2net + largest-component, and either way crops to
+the subject and pads square. `--method corner` or `rembg` pins one key; the
+refusal is then an error rather than a substitution, which is the point of
+asking for it.
+
+The framing is the part that matters, and it is why this belongs in the
+worker rather than the engine. The engine's own rembg pass keys and stops:
+no crop, no square pad. The generator frames its latent around the whole
+image, so a subject occupying a third of the frame was being reconstructed
+at a third of the available resolution. Measured end to end on the raw
+garden scene, no manual prep:
+
+    cutout (rembg+largest-component, 16.8% opaque, 1 stray island(s) dropped)
+    shape
+    decimate (542320 -> 40000)
+    160.0s, 40,000 faces, watertight, 6.22 GiB peak reserved
+
+The mesh that comes back is the lantern alone, correctly proportioned, with
+no rock beside it.
+
+Two consequences. `~/.u2net/u2net.onnx` (176MB) is now load-bearing rather
+than incidental — it downloads silently on first use, so the installer
+prefetches it and `server_status` checks for it. And the engine's own rembg
+is now a safety net for one case only: a `HY3D_PY` pointed at an interpreter
+that cannot import rembg. The stage line says so when it happens.

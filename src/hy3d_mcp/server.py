@@ -354,18 +354,22 @@ async def generate_model(
                     cut = await asyncio.to_thread(
                         _run_worker, "cutout.py", [str(src), str(rgba)])
                     gen_input = Path(cut["png_path"])
-                    stages.append("cutout (%.1f%% opaque)" % cut["opaque_pct"])
+                    stages.append("cutout (%s, %.1f%% opaque%s)"
+                                  % (cut.get("method", "corner"),
+                                     cut["opaque_pct"],
+                                     ", %d stray island(s) dropped"
+                                     % cut["components_dropped"]
+                                     if cut.get("components_dropped") else ""))
                 except RuntimeError as e:
-                    # The local key refuses busy backgrounds rather than
-                    # shredding them. That is not a dead end here: the engine
-                    # venv carries rembg, which handles painted concept art
-                    # the corner-sample key cannot. Let the engine do it --
-                    # but rembg only keys. cutout.py also crops to the alpha
-                    # bbox and pads square, so the subject fills the latent
-                    # instead of sharing it with empty background; the fallback
-                    # input is framed differently, not merely keyed differently.
+                    # Both of the worker's keys failed, which on a stock setup
+                    # means its interpreter cannot reach rembg at all. The
+                    # engine carries its own copy and runs it on any input
+                    # without alpha, so generation still has a path -- a worse
+                    # one, since rembg only keys: the worker also crops to the
+                    # alpha bbox and pads square, so the subject fills the
+                    # latent instead of sharing it with empty background.
                     stages.append(
-                        "cutout skipped (%s); keyed by rembg in-engine, "
+                        "cutout failed (%s); the engine will key it itself, "
                         "without the square recrop"
                         % str(e).split(": ", 1)[-1][:200])
 
@@ -485,25 +489,42 @@ def export_stl(
 
 
 @mcp.tool
-def prepare_concept(image_path: str, output_path: str | None = None) -> dict:
-    """Key a plain-background concept image out to a centered square RGBA PNG.
+def prepare_concept(image_path: str, output_path: str | None = None,
+                    method: str = "auto") -> dict:
+    """Key a concept image out to a centered square RGBA PNG.
 
     Standalone version of generate_model's auto_cutout, for callers that
-    want the intermediate. Refuses inputs whose corners disagree (busy
-    background) rather than shredding them. Warns when the opaque fraction
-    looks like a bad key.
+    want to see the intermediate. Reach for it when you want to check the
+    cutout, not as a required first step.
 
-    A refusal here does not block generation: generate_model falls back to
-    the engine venv's rembg, which handles painted concept art this
-    corner-sampling key cannot. Reach for this tool when you want to see and
-    check the cutout, not as a required first step.
+    Two keys, tried in order under the default method="auto":
+
+    - **corner** — samples the four corners and keys everything near that
+      color. Free and exact on a single object over a plain background, and
+      it refuses inputs whose corners disagree rather than shredding them.
+    - **rembg** — u2net segmentation, for the painted concept art the corner
+      key cannot touch. Keeps every subject it finds, so the result is
+      filtered to the largest connected island: garden art otherwise brings
+      along a loose rock and a piece of cast shadow, and each becomes its
+      own geometry in the model.
+
+    Either way the result is cropped to the subject and padded square, which
+    is what makes it worth running instead of letting the engine key the
+    image itself: the generator frames its latent around the whole image, so
+    a centered subject spends the resolution on the subject.
+
+    method="corner" or "rembg" pins the key instead. Pinning to corner turns
+    the refusal into an error rather than a fallback, which is the point of
+    asking for it.
     """
+    if method not in ("auto", "corner", "rembg"):
+        raise ValueError("method must be auto, corner or rembg (got %r)" % method)
     src = Path(image_path).expanduser().resolve()
     if not src.is_file():
         raise ValueError("input image not found: %s" % src)
     dst = _out_path(src.stem + "-rgba", ".png", output_path)
     started = time.monotonic()
-    out = _run_worker("cutout.py", [str(src), str(dst)])
+    out = _run_worker("cutout.py", [str(src), str(dst), "--method", method])
     _record_job("prepare_concept", src.name, True, time.monotonic() - started)
     pct = out["opaque_pct"]
     if pct < 8.0:

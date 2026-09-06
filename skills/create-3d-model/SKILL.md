@@ -56,8 +56,9 @@ Compose the image prompt from the user's description plus ALL of these:
 - **single object**, whole object in frame, roughly centered
 - **three-quarter view** (shows front and side; best geometry recovery)
 - **plain, uniform background** — nothing else in frame, and a flat single
-  tone rather than a gradient or vignette. The local cutout keys on corner
-  colour, so hard figure/ground separation matters. Light gray is the
+  tone rather than a gradient or vignette. The cheap cutout keys on corner
+  colour, so hard figure/ground separation keeps it off the slower
+  segmentation fallback. Light gray is the
   default. When the subject has no white or near-white parts, **pure white
   with product-cutout framing** ("isolated on seamless white, catalog
   product cutout") is worth trying — it came back clean once where two
@@ -91,12 +92,19 @@ gradient-gray background keyed at 36% partial alpha and left patches of
 background fully **opaque** — the key had smeared rather than separated. A
 flat white background of the same subject keyed at 0.1% partial.
 
-A `prepare_concept` refusal ("corner patches disagree") is a signal about
-the image, not a blocker. `generate_model` falls back to a learned
-background remover that handles painted concept art the corner-sampling key
-cannot. Treat the refusal as a prompt to check whether the background is
-really plain — then generate anyway if the user is working from art they
-already have.
+When `prepare_concept` reports `method: rembg+largest-component` instead of
+`corner`, the corner key declined the image and a segmentation model keyed
+it instead. That is a signal about the image, not a blocker — but read it
+as one. It means the background was not plain, so check the result: the
+`note` field carries the corner key's reason, and `components_dropped`
+counts the extra subjects the segmenter found and threw away. On a garden
+scene that drop is exactly right (a loose rock became its own island); on a
+two-part subject it is the second part going missing.
+
+Either way the image is cropped to the subject and padded square before it
+reaches the generator, so a subject that filled a third of the frame is not
+generated at a third of the resolution. Working from art the user already
+has is fine — this is the path that makes it fine.
 
 Show the concept to the user before spending generation time, unless they
 asked you to just go ahead.
