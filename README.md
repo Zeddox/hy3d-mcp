@@ -1,5 +1,17 @@
 # hy3d-mcp
 
+> **This branch (`wsl2-cuda-port`) targets WSL2 + NVIDIA CUDA, not Apple
+> Silicon.** The server now drives upstream
+> [Hunyuan3D-2](https://github.com/Tencent/Hunyuan3D-2) (PyTorch) through
+> `scripts/provision-engine.sh`, and it generates **shape only** — the
+> texture pass needs more VRAM than an 8GB consumer card has, so
+> `paint_mesh` refuses rather than half-running. Everything below the
+> Requirements heading still describes the macOS/MLX build and has not been
+> rewritten yet; the installer and this README are the next phase of the
+> port. For setup on this branch: `bash scripts/provision-engine.sh`, then
+> call the `server_status` tool. See [`docs/wsl2-port.md`](docs/wsl2-port.md)
+> for what carried over and what did not.
+
 An MCP server that turns a single concept image into a game-ready textured
 3D model (GLB), fully locally on Apple Silicon, by wrapping the
 [Hunyuan3D-MLX](https://github.com/ZimengXiong/hunyuan3d-mlx) pipeline

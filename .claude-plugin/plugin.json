@@ -1,7 +1,7 @@
 {
   "name": "hy3d-gen",
   "displayName": "hy3d-gen — local image-to-3D",
-  "version": "0.4.1",
+  "version": "0.5.0",
   "description": "Generate textured 3D models (GLB) from a prompt or concept image, fully locally on Apple Silicon via Hunyuan3D-MLX. Bundles the hy3d-gen MCP server and a create-3d-model skill.",
   "author": { "name": "Jim Cline" },
   "license": "MIT",

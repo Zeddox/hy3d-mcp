@@ -1,13 +1,27 @@
-"""Phase 1: drive Hunyuan3D-2 shape generation from the CLI, no MCP.
+"""Drive Hunyuan3D-2 shape generation under the engine interpreter.
 
-Shape-only. Produces an untextured GLB and reports the numbers that decide
-whether this box can actually run the engine.
+Runs as a subprocess of the MCP server, never imported by it: the engine
+venv carries torch/CUDA and the server venv does not, so the only thing
+crossing between them is argv and stdout.
 
-Why the instrumentation matters: on WSL2 the failure mode is *thrashing, not
-OOM*. WDDM satisfies CUDA allocations past VRAM out of system RAM, so an
-oversized job completes rather than raising -- it just crawls at PCIe
-bandwidth. "It finished" is therefore not evidence it fit. Peak resident
-bytes and wall-clock are.
+Shape-only, by design rather than by omission. The paint stage wants more
+VRAM than an 8GB card has, so this emits an untextured GLB and leaves
+material work to the caller's DCC or engine.
+
+Two output contracts the server depends on:
+
+  * progress lines of the form `[ NN%] message` on stdout, which the
+    server's `_PROGRESS_LINE` parser relays to the MCP client. The budget
+    is deliberately lopsided -- diffusion owns 8-40% and volume decoding
+    40-95% -- because decoding is roughly twice the wall-clock of
+    diffusion at octree 384. A bar that hit 100% a third of the way in
+    would look hung for the remaining two thirds.
+  * a single-line JSON object as the LAST line of stdout.
+
+The instrumentation exists because on WSL2 the failure mode is *thrashing,
+not OOM*: WDDM satisfies CUDA allocations past VRAM out of system RAM, so
+an oversized job completes rather than raising -- it just crawls at PCIe
+bandwidth. "It finished" is not evidence it fit.
 """
 import argparse
 import json
@@ -18,6 +32,15 @@ import time
 from pathlib import Path
 
 GIB = 1024 ** 3
+
+# Where each stage's slice of the progress bar starts and ends. Measured at
+# octree 384 on a 3060 Ti: ~36s diffusion against ~84s decode.
+P_LOADED, P_DIFFUSION_END, P_DECODE_END = 8.0, 40.0, 95.0
+
+
+def emit(pct, message):
+    """One progress line in the form the server's parser expects."""
+    print("[%3d%%] %s" % (int(pct), message), flush=True)
 
 
 def nvidia_smi_used():
@@ -55,7 +78,7 @@ def glb_attributes(path):
                 attrs |= {k for k, v in vars(p.attributes).items() if v is not None}
         return sorted(attrs)
     except Exception as e:
-        return [f"<unreadable: {e}>"]
+        return ["<unreadable: %s>" % e]
 
 
 def main():
@@ -93,9 +116,9 @@ def main():
 
     free0, total = torch.cuda.mem_get_info()
     smi0, smi_total = nvidia_smi_used()
-    print(f"[gpu] {torch.cuda.get_device_name(0)}  "
-          f"free {free0/GIB:.2f} / {total/GIB:.2f} GiB"
-          + (f"  (nvidia-smi used {smi0} MiB)" if smi0 is not None else ""))
+    print("[gpu] %s  free %.2f / %.2f GiB%s"
+          % (torch.cuda.get_device_name(0), free0 / GIB, total / GIB,
+             "  (nvidia-smi used %d MiB)" % smi0 if smi0 is not None else ""))
 
     # Upstream's minimal_demo converts to RGBA and *then* tests mode == 'RGB',
     # so its background removal never runs. Test the source image instead, and
@@ -104,7 +127,7 @@ def main():
     has_alpha = src.mode in ("RGBA", "LA") and src.getchannel("A").getextrema()[0] < 255
     image = src.convert("RGBA")
     if not has_alpha:
-        print("[input] no usable alpha -- running background removal")
+        emit(1, "removing background")
         from hy3dgen.rembg import BackgroundRemover
         image = BackgroundRemover()(image)
     else:
@@ -112,7 +135,7 @@ def main():
 
     subfolder = args.subfolder or (
         "hunyuan3d-dit-v2-mini" if "mini" in args.model else "hunyuan3d-dit-v2-0")
-    print(f"[load] {args.model} :: {subfolder}")
+    emit(2, "loading %s" % args.model)
     t = time.time()
     # A "missing keys" warning for the VAE encoder is expected and benign:
     # the bundled checkpoint ships a decoder-only VAE and loads strict=False.
@@ -142,7 +165,26 @@ def main():
         pipe.device = torch.device("cuda")
     load_s = time.time() - t
     after_load = (free0 - torch.cuda.mem_get_info()[0]) / GIB
-    print(f"[load] {load_s:.1f}s, {after_load:.2f} GiB resident")
+    emit(P_LOADED, "loaded in %.0fs, %.2f GiB resident" % (load_s, after_load))
+
+    # The denoising loop is the only part of pipe() that can report from the
+    # inside. Volume decoding runs after it, still inside the same call, so
+    # the last step hands the bar over to the heartbeat at P_DIFFUSION_END
+    # and the decode's own tqdm goes to stderr where nothing parses it.
+    span = P_DIFFUSION_END - P_LOADED
+    done = {"n": 0}
+
+    def on_step(step_idx, t_, outputs):
+        # `outputs` holds scheduler tensors; touching it here would cost a
+        # device sync per step for nothing. Count invocations instead --
+        # step_idx is divided by the scheduler order and need not be dense.
+        done["n"] += 1
+        n = done["n"]
+        emit(P_LOADED + span * min(n / max(args.steps, 1), 1.0),
+             "diffusion step %d/%d" % (n, args.steps))
+        if n >= args.steps:
+            emit(P_DIFFUSION_END,
+                 "decoding volume at octree %d" % args.octree_resolution)
 
     torch.cuda.reset_peak_memory_stats()
     t = time.time()
@@ -152,15 +194,24 @@ def main():
         guidance_scale=args.guidance_scale,
         octree_resolution=args.octree_resolution,
         generator=torch.manual_seed(args.seed),
+        callback=on_step,
+        # Required, not merely advisory: the loop evaluates `i %
+        # callback_steps` whenever a callback is set, and the default None
+        # makes that a TypeError on the first step.
+        callback_steps=1,
     )[0]
     gen_s = time.time() - t
 
     raw_faces = int(len(mesh.faces))
-    if args.max_faces:
+    reduce_s = None
+    if args.max_faces and raw_faces > args.max_faces:
         from hy3dgen.shapegen import FaceReducer, FloaterRemover
+        emit(P_DECODE_END, "decimating %d -> %d faces" % (raw_faces, args.max_faces))
         t = time.time()
         mesh = FaceReducer()(FloaterRemover()(mesh), max_facenum=args.max_faces)
-        print(f"[reduce] {raw_faces} -> {len(mesh.faces)} faces in {time.time()-t:.1f}s")
+        reduce_s = round(time.time() - t, 1)
+    else:
+        emit(P_DECODE_END, "%d faces" % raw_faces)
 
     peak = torch.cuda.max_memory_allocated() / GIB
     # Reserved, not resident, is the spill signal. Resident includes blocks the
@@ -179,6 +230,12 @@ def main():
     # mesh off one constant vector, which reads as a broken material rather
     # than a missing attribute.
     mesh.export(str(out), include_normals=True)
+    emit(100, "wrote %s" % out.name)
+
+    # The thrash signature: torch *reserved* more than the card can hold, so
+    # the remainder was served from host RAM over PCIe.
+    ceiling = free0 / GIB
+    spilled = reserved >= ceiling - 0.10
 
     stats = {
         "output": str(out),
@@ -190,24 +247,26 @@ def main():
         "glb_attributes": glb_attributes(out),
         "load_s": round(load_s, 1),
         "generate_s": round(gen_s, 1),
+        "reduce_s": reduce_s,
         "peak_torch_alloc_gib": round(peak, 2),
         "peak_torch_reserved_gib": round(reserved, 2),
         "resident_after_gib": round(resident, 2),
-        "free_at_baseline_gib": round(free0 / GIB, 2),
+        "free_at_baseline_gib": round(ceiling, 2),
         "nvidia_smi_used_mib": smi1,
         "settings": {"model": args.model, "steps": args.steps,
                      "octree_resolution": args.octree_resolution,
                      "guidance_scale": args.guidance_scale, "seed": args.seed,
                      "cpu_offload": args.cpu_offload, "flashvdm": args.flashvdm},
     }
-    print(json.dumps(stats, indent=2))
-
-    # The thrash signature: torch *reserved* more than the card can hold, so
-    # the remainder was served from host RAM over PCIe.
-    if reserved >= (free0 / GIB) - 0.10:
-        print("\n[warn] torch reserved %.2f GiB against a %.2f GiB ceiling -- this "
-              "run likely spilled to host RAM. Re-run with --cpu-offload and "
-              "compare generate_s." % (reserved, free0 / GIB), file=sys.stderr)
+    if spilled:
+        stats["warning"] = (
+            "torch reserved %.2f GiB against a %.2f GiB ceiling -- this run "
+            "likely spilled to host RAM and ran at PCIe speed. Retry with "
+            "cpu_offload=True, or a lower octree, and compare generate_s."
+            % (reserved, ceiling))
+    # Last line of stdout, single line: the server reads it back as the
+    # result contract.
+    print(json.dumps(stats))
 
 
 if __name__ == "__main__":

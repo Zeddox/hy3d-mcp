@@ -1,12 +1,18 @@
-"""hy3d-gen MCP server: local image-to-3D via Hunyuan3D-MLX.
+"""hy3d-gen MCP server: local image-to-3D via Hunyuan3D-2 on CUDA.
 
-Stdio FastMCP process; no ML code lives here. Generation shells out to the
-hy3d Swift binary, image work shells out to the worker venv (HY3D_PY) via
-the scripts in workers/. Tools return file paths, never blobs.
+Stdio FastMCP process; no ML code lives here. Generation shells out to
+engine_cli.py under the engine venv (torch + CUDA), image and mesh work
+shells out to the worker venv (HY3D_PY) via the scripts in workers/. Tools
+return file paths, never blobs.
+
+Shape-only. The paint stage wants more VRAM than a consumer 8GB card has,
+so this server produces untextured geometry and says so rather than
+half-running a texture pass; materials are the caller's job downstream.
 
 Config (env, with defaults):
-  HY3D_REPO  Hunyuan3D-MLX checkout        (~/git/repos/hunyuan3d-mlx)
-  HY3D_PY    worker venv python w/ cv2 etc (~/.hy3d/worker-venv/bin/python)
+  HY3D_ENGINE_REPO  Hunyuan3D-2 checkout   (~/git/repos/Hunyuan3D-2)
+  HY3D_ENGINE_PY    engine venv python     (~/.hy3d/engine-venv/bin/python)
+  HY3D_PY    worker python w/ cv2 etc   (defaults to the engine venv)
   HY3D_OUT   default output directory      (~/hy3d-output)
 """
 import asyncio
@@ -21,54 +27,56 @@ from pathlib import Path
 from fastmcp import Context, FastMCP
 from PIL import Image
 
-HY3D_REPO = Path(os.environ.get("HY3D_REPO", "~/git/repos/hunyuan3d-mlx")).expanduser()
-HY3D_PY = Path(os.environ.get("HY3D_PY", "~/.hy3d/worker-venv/bin/python")).expanduser()
+ENGINE_REPO = Path(os.environ.get(
+    "HY3D_ENGINE_REPO", "~/git/repos/Hunyuan3D-2")).expanduser()
+ENGINE_PY = Path(os.environ.get(
+    "HY3D_ENGINE_PY", "~/.hy3d/engine-venv/bin/python")).expanduser()
+# Defaults to the engine venv rather than a second one. provision-engine.sh
+# builds a single environment that already carries the worker stack
+# (numpy/PIL/trimesh/scipy/cv2/pygltflib/pyrender), so splitting it here
+# would only invent a venv that is never created. Still overridable: the
+# separation exists so mesh and image work can run without loading torch.
+HY3D_PY = Path(os.environ.get(
+    "HY3D_PY", os.environ.get("HY3D_ENGINE_PY", "~/.hy3d/engine-venv/bin/python"))
+).expanduser()
 HY3D_OUT = Path(os.environ.get("HY3D_OUT", "~/hy3d-output")).expanduser()
 
 WORKERS = Path(__file__).parent / "workers"
 
 
-def _find_installer() -> Path:
-    """install.sh sits at the repo root in a checkout or plugin cache, and
-    beside the package in a wheel (force-included there, since a wheel
-    carries no repo root). Prefer the checkout so a source tree under
-    development wins over a stale installed copy."""
-    here = Path(__file__).resolve()
-    root, packaged = here.parent.parent.parent / "install.sh", here.parent / "install.sh"
-    return packaged if packaged.is_file() and not root.is_file() else root
+# Ships inside the package rather than in scripts/, so a wheel install can
+# still find it: a wheel carries no repo root. Invoked by absolute path
+# under ENGINE_PY, never imported -- the engine venv has torch, this one
+# does not, and the only thing crossing between them is argv and stdout.
+ENGINE_CLI = Path(__file__).parent / "engine_cli.py"
 
-
-INSTALLER = _find_installer()
-BINARY = HY3D_REPO / ".build/release/hy3d"
-METALLIB_DIR = HY3D_REPO / "metallib"
-# .build/release is a symlink; this is the real dir the binary also loads from
-BUILD_REAL = HY3D_REPO / ".build/arm64-apple-macosx/release"
-
-# A runaway backstop, not a normal bound: a lattice-heavy concept at octree
-# 384 legitimately runs 15+ minutes, and progress notifications now keep the
-# client from timing out underneath a job that is making progress.
+# A runaway backstop, not a normal bound: shape at octree 384 runs ~2
+# minutes on a 3060 Ti, but a run that has spilled into host RAM crawls at
+# PCIe bandwidth and can take an order of magnitude longer.
 GENERATE_TIMEOUT = 5400.0
 WORKER_TIMEOUT = 300.0
-# A cold setup is a ~4 min build plus a 12GB download on whatever link is going.
-SETUP_TIMEOUT = 7200.0
-# Idle gap the client tolerates is what this has to stay under; paint's pbr
-# path can run many minutes without printing a line.
+# Idle gap the client tolerates is what this has to stay under. Volume
+# decoding is the majority of a job's wall-clock and reports nothing the
+# server can parse, so the heartbeat carries that whole stretch.
 HEARTBEAT_SECONDS = 15.0
 
 mcp = FastMCP(
     "hy3d-gen",
     instructions=(
-        "Local image-to-3D generation (Hunyuan3D-MLX). Feed NATURALLY LIT "
+        "Local image-to-3D generation (Hunyuan3D-2 on CUDA). Produces "
+        "UNTEXTURED geometry — there is no texture stage on this build, so "
+        "do not promise the user a painted model. Feed NATURALLY LIT "
         "concept art of a single object on a plain background, no drop "
         "shadows. Models land as file paths; importing them into an engine "
-        "is the caller's job. Generation is serialized — one job at a time "
-        "(paint peaks ~30GB unified memory); shape-only ~20s, "
-        "shape+paint ~3-4 min."
+        "is the caller's job, and export_stl converts one for printing. "
+        "Generation is serialized — one job at a time — and takes ~2 min at "
+        "the default octree."
     ),
 )
 
-# One generation at a time: paint peaks ~25-33GB unified memory, so parallel
-# jobs would OOM the machine, not just slow it. Callers queue on the lock.
+# One generation at a time. On WSL2 the second job would not fail cleanly:
+# WDDM serves CUDA allocations past VRAM out of system RAM, so both jobs
+# would finish having crawled at PCIe bandwidth instead of one erroring.
 _job_lock = asyncio.Lock()
 _queue_depth = 0
 _queue_guard = threading.Lock()
@@ -111,7 +119,6 @@ def _has_real_alpha(path: Path) -> bool:
 
 
 _PROGRESS_LINE = re.compile(r"^\s*\[\s*(\d+)\s*%\]\s*(.*)$")
-_STAGE_MARKER = re.compile(r"^generate\[(\d)/2\]\s*(\w+)")
 
 
 def _mmss(seconds: float) -> str:
@@ -119,9 +126,8 @@ def _mmss(seconds: float) -> str:
 
 
 async def _run_engine(cmd: list[str], env: dict[str, str], ctx: Context | None,
-                      two_stage: bool,
                       stage: str = "shape") -> tuple[int, str, str, bool]:
-    """Run the hy3d binary, relaying its progress to the MCP client.
+    """Run the engine driver, relaying its progress to the MCP client.
 
     Returns (returncode, stdout, stderr, streamed). Two things a plain
     blocking run cannot do: relay a heartbeat — from outside, a slow job and
@@ -135,13 +141,10 @@ async def _run_engine(cmd: list[str], env: dict[str, str], ctx: Context | None,
     """
     global _current_proc
     proc = await asyncio.create_subprocess_exec(
-        *cmd, cwd=str(HY3D_REPO), env=env,
+        *cmd, cwd=str(ENGINE_REPO), env=env,
         stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE)
     _current_proc = proc
-    # In a two-stage generate, shape owns the first half of the bar and paint
-    # the second; the shape subcommand alone owns all of it.
-    state = {"base": 0.0, "width": 50.0 if two_stage else 100.0,
-             "last": 0.0, "stage": stage}
+    state = {"base": 0.0, "width": 100.0, "last": 0.0, "stage": stage}
     out: list[str] = []
     err: list[str] = []
     started = time.monotonic()
@@ -168,11 +171,6 @@ async def _run_engine(cmd: list[str], env: dict[str, str], ctx: Context | None,
             buf.append(line)
             if not watch:
                 continue
-            m = _STAGE_MARKER.match(line)
-            if m:
-                state["stage"] = m.group(2)
-                state["base"] = 0.0 if m.group(1) == "1" else 50.0
-                continue
             m = _PROGRESS_LINE.match(line)
             if m:
                 await report(
@@ -180,8 +178,9 @@ async def _run_engine(cmd: list[str], env: dict[str, str], ctx: Context | None,
                     "%s: %s" % (state["stage"], m.group(2).strip()))
 
     async def heartbeat() -> None:
-        # The pbr paint path prints nothing for minutes at a stretch, so real
-        # progress lines alone would not keep the client's idle timer alive.
+        # Volume decoding is the majority of the run and emits no line the
+        # server parses, so real progress alone would not keep the client's
+        # idle timer alive across it.
         # The bar creeps toward the stage ceiling because the value must rise;
         # the message carries the honest part, which is elapsed time.
         while True:
@@ -228,82 +227,93 @@ def _add_normals(glb: Path) -> dict:
         return {"normals_added": False, "warning": "normals pass failed: %s" % e}
 
 
-def _mesh_counts(glb: Path) -> dict:
-    """Read vertex and triangle counts off a finished GLB.
-
-    Never raises, for the same reason as _add_normals: a reporting detail is
-    not worth failing a completed bake over.
-    """
-    try:
-        return _run_worker("meshinfo.py", [str(glb)])
-    except Exception:
-        return {}
-
-
 def _out_path(stem: str, suffix: str, explicit: str | None) -> Path:
+    # Absolute, always. The engine child runs with cwd set to the Hunyuan3D
+    # checkout so its own imports resolve, which means a relative path handed
+    # in by the caller would be written somewhere neither of us meant.
     if explicit:
-        p = Path(explicit).expanduser()
+        p = Path(explicit).expanduser().resolve()
     else:
         p = HY3D_OUT / (stem + suffix)
     p.parent.mkdir(parents=True, exist_ok=True)
     return p
 
 
+def _engine_json(stdout: str) -> dict:
+    """Pull engine_cli's result object off the last JSON line of stdout.
+
+    Progress lines share the stream, so this scans upward for the first line
+    that parses rather than assuming the last line is the payload.
+    """
+    for line in reversed(stdout.strip().splitlines()):
+        line = line.strip()
+        if line.startswith("{"):
+            try:
+                return json.loads(line)
+            except json.JSONDecodeError:
+                continue
+    return {}
+
+
 @mcp.tool
 async def generate_model(
     image_path: str,
     output_path: str | None = None,
-    paint: bool = True,
-    texture_size: int = 2048,
     seed: int = 42,
     auto_cutout: bool = True,
-    finish: bool = False,
+    max_faces: int = 40000,
     octree: int | None = None,
-    paint_res: int | None = None,
-    paint_steps: int | None = None,
     steps: int | None = None,
     guidance: float | None = None,
-    superres: bool = True,
-    normals: bool = True,
+    model: str | None = None,
+    cpu_offload: bool = False,
+    paint: bool = False,
     ctx: Context | None = None,
 ) -> dict:
-    """Turn a concept image into a textured 3D model (GLB).
+    """Turn a concept image into an UNTEXTURED 3D model (GLB).
 
-    paint=False skips texturing (shape only, ~20s vs ~3-4 min) — it runs a
-    different engine subcommand, so paint_res/paint_steps/finish are
-    rejected rather than ignored, and no .views.png sheet is written.
+    There is no texture stage on this build — the paint pipeline wants more
+    VRAM than the card has — so the result is clean geometry with normals
+    and no UVs or material. Say that to the user rather than letting them
+    expect colour; passing paint=True is an error, not a slow path.
+
+    What the shape stage does and does not give you: it resolves silhouette
+    and large forms faithfully, and it does not resolve surface relief.
+    Carved ornament, panel lines and fabric folds present in the concept art
+    come back smooth at every octree setting. That is the model's range, not
+    a knob you have not found — such detail belongs in a normal or
+    displacement map applied later.
+
     auto_cutout keys out a plain background first unless the input already
-    carries real transparency. finish=True applies the game-look texture
-    pass (see finish_model) after generation.
-    normals=True (default) injects the glTF NORMAL attribute the engine
-    omits; without it Godot and friends light the whole mesh off one
-    constant vector, which reads as a bad material rather than a missing
-    attribute. Geometry is untouched either way.
+    carries real transparency. Leave it on.
+    max_faces decimates the raw output (typically 600k–1M faces, which is
+    not something to hand an engine) down to a game-ready budget; 0 keeps
+    the raw mesh. Decimation preserves watertightness.
     Blocks while an earlier generation is running (single-job queue).
 
-    Quality knobs, in rough order of effect. Each defaults to None, which
-    omits the flag so the binary's own default (in parens) applies. Paint
-    peaks ~25-33GB unified memory and octree/paint_res/texture_size each
-    multiply that, so raise them one at a time.
+    Quality knobs. Each defaults to None, which lets the driver's own
+    default (in parens) apply.
 
-      octree (256)      marching-cubes resolution — the geometry lever.
-                        384/512 resolve thin struts the default fuses;
-                        vertex count grows roughly cubically.
-      paint_res (512)   resolution the multiview texture diffusion runs
-                        at — the texture-sharpness lever.
-      paint_steps (15)  texture diffusion steps; low next to shape's 30.
-      steps (30)        shape diffusion steps; diminishing past ~50.
-      guidance (5.0)    how tightly shape follows the image; higher is
-                        more faithful but can over-sharpen.
+      octree (384)      marching-cubes resolution. This is a TESSELLATION
+                        density dial, not a detail dial: raising it to 512
+                        buys more triangles describing the same surface and
+                        recovers no relief, at roughly double the runtime.
+                        Leave it alone unless thin struts are fusing.
+      steps (50)        shape diffusion steps; diminishing well before this.
+      guidance (5.0)    how tightly shape follows the image; higher is more
+                        faithful but can over-sharpen.
 
-    texture_size: 512|1024|2048|4096, baked texture resolution. The binary's
-    own pbr default is 4096; 2048 here keeps peak memory modest.
-    superres=False skips the texture super-resolution pass.
-    The binary itself validates none of these — out-of-range values fail
-    slowly or bake garbage, so prefer moving one knob a single step.
+    model: 'tencent/Hunyuan3D-2' (default, 3.3B) or 'tencent/Hunyuan3D-2mini'.
+    2mini is roughly twice as fast and its renders look comparable, but it
+    tends to produce a thin hollow shell where the full model produces a
+    solid — a difference invisible in a preview and fatal to a print. Prefer
+    the default; check export_stl's bbox_fill_pct if you use 2mini.
+    cpu_offload=True runs the stages sequentially through host RAM. It is
+    the lever when the returned peak_reserved_gib sits at the card's
+    ceiling, and it costs runtime, so it is off by default.
     """
     global _queue_depth
-    src = Path(image_path).expanduser()
+    src = Path(image_path).expanduser().resolve()
     if not src.is_file():
         raise ValueError("input image not found: %s" % src)
     try:
@@ -311,30 +321,22 @@ async def generate_model(
             im.verify()
     except Exception as e:
         raise ValueError("input is not a readable image: %s (%s)" % (src, e))
-    if texture_size not in (512, 1024, 2048, 4096):
-        raise ValueError("texture_size must be 512, 1024, 2048 or 4096")
-    for name, val in (("octree", octree), ("paint_res", paint_res),
-                      ("paint_steps", paint_steps), ("steps", steps)):
+    if paint:
+        raise ValueError(
+            "this build has no texture stage: Hunyuan3D's paint pipeline "
+            "needs more VRAM than this card has, so the server generates "
+            "shape only. Call with paint=False (the default) and texture "
+            "the GLB downstream.")
+    for name, val in (("octree", octree), ("steps", steps)):
         if val is not None and val < 1:
             raise ValueError("%s must be a positive integer" % name)
     if guidance is not None and guidance < 0:
         raise ValueError("guidance must be >= 0")
-    if not paint:
-        # Caught here rather than after a successful shape run, which would
-        # spend the geometry pass before failing.
-        dead = [n for n, v in (("paint_res", paint_res),
-                               ("paint_steps", paint_steps)) if v is not None]
-        if dead:
-            raise ValueError("paint=False runs the shape-only subcommand, "
-                             "which has no paint pass — remove %s or set "
-                             "paint=True" % " and ".join(dead))
-        if finish:
-            raise ValueError("finish=True needs a painted model — it retextures "
-                             "an albedo map that shape-only output lacks")
+    if max_faces < 0:
+        raise ValueError("max_faces must be >= 0 (0 disables decimation)")
 
     dst = _out_path(src.stem, ".glb", output_path)
     stages: list[str] = []
-    warning: str | None = None
     started = time.monotonic()
     with _queue_guard:
         _queue_depth += 1
@@ -343,245 +345,122 @@ async def generate_model(
             gen_input = src
             if auto_cutout and not _has_real_alpha(src):
                 rgba = HY3D_OUT / "intermediate" / (src.stem + "-rgba.png")
-                cut = await asyncio.to_thread(
-                    _run_worker, "cutout.py", [str(src), str(rgba)])
-                gen_input = Path(cut["png_path"])
-                stages.append("cutout (%.1f%% opaque)" % cut["opaque_pct"])
+                try:
+                    cut = await asyncio.to_thread(
+                        _run_worker, "cutout.py", [str(src), str(rgba)])
+                    gen_input = Path(cut["png_path"])
+                    stages.append("cutout (%.1f%% opaque)" % cut["opaque_pct"])
+                except RuntimeError as e:
+                    # The local key refuses busy backgrounds rather than
+                    # shredding them. That is not a dead end here: the engine
+                    # venv carries rembg, which handles painted concept art
+                    # the corner-sample key cannot. Let the engine do it.
+                    stages.append("cutout skipped (%s); using rembg in-engine"
+                                  % str(e).split(": ", 1)[-1][:120])
 
-            # Shape-only is a separate subcommand, not a dropped flag: the
-            # binary's `generate` requires --paint-weights unconditionally,
-            # and `shape` names the shape checkpoint --weights instead of
-            # --shape-weights. The shared knobs below apply to both.
-            if paint:
-                cmd = [str(BINARY), "generate", str(gen_input), "-o", str(dst),
-                       "--shape-weights", "weights/shape-small",
-                       "--paint-weights", "weights/paint-large",
-                       "--paint-model", "pbr", "--tex", str(texture_size)]
-                if paint_steps is not None:
-                    cmd += ["--paint-steps", str(paint_steps)]
-                if paint_res is not None:
-                    cmd += ["--res", str(paint_res)]
-                if not superres:
-                    cmd.append("--no-superres")
-            else:
-                cmd = [str(BINARY), "shape", str(gen_input), "-o", str(dst),
-                       "--weights", "weights/shape-small"]
-            cmd += ["--seed", str(seed)]
+            cmd = [str(ENGINE_PY), str(ENGINE_CLI), str(gen_input),
+                   "-o", str(dst), "--seed", str(seed),
+                   "--max-faces", str(max_faces),
+                   "--engine", str(ENGINE_REPO)]
+            if model:
+                cmd += ["--model", model]
             if steps is not None:
                 cmd += ["--steps", str(steps)]
             if guidance is not None:
-                cmd += ["--guidance", str(guidance)]
+                cmd += ["--guidance-scale", str(guidance)]
             if octree is not None:
-                cmd += ["--octree", str(octree)]
-            env = os.environ | {"METAL_PATH": str(METALLIB_DIR),
-                                "MLX_METAL_PATH": str(METALLIB_DIR)}
-            rc, so, se, streamed = await _run_engine(cmd, env, ctx, paint)
-            if rc != 0 and "--seed" in " ".join(se[-500:].lower().split()):
-                # Older builds without a seed flag: drop it and retry once.
-                cmd = [c for i, c in enumerate(cmd)
-                       if c != "--seed" and cmd[i - 1] != "--seed"]
-                rc, so, se, streamed = await _run_engine(cmd, env, ctx, paint)
+                cmd += ["--octree-resolution", str(octree)]
+            if cpu_offload:
+                cmd.append("--cpu-offload")
+            rc, so, se, streamed = await _run_engine(cmd, os.environ.copy(), ctx)
             if rc != 0 or not dst.is_file():
                 _record_job("generate_model", src.name, False,
                             time.monotonic() - started)
-                raise RuntimeError("hy3d %s failed (exit %d):\n%s"
-                                   % (cmd[1], rc, (se or so)[-2000:]))
-            stages.append("shape+paint" if paint else "shape")
-
-            verts = faces = None
-            m = re.search(r"([\d,]+)\s*vert", so, re.I)
-            if m:
-                verts = int(m.group(1).replace(",", ""))
-            m = re.search(r"([\d,]+)\s*(?:faces|tris|triangles)", so, re.I)
-            if m:
-                faces = int(m.group(1).replace(",", ""))
-
-            if finish:
-                fin = await asyncio.to_thread(
-                    _run_worker, "finish.py", [str(dst), str(dst)])
-                stages.append("finish (%.1f%% accents)"
-                              % fin["accent_coverage_pct"])
-
-            if normals:
-                # Last: finish.py round-trips through trimesh, which would
-                # drop the attribute again if it were injected before.
-                nrm = await asyncio.to_thread(_add_normals, dst)
-                if nrm.get("normals_added"):
-                    stages.append("normals (%d)" % nrm["count"])
-                elif nrm.get("warning"):
-                    warning = nrm["warning"]
-
-            # The counts above came from the engine's own line, which describes
-            # the shape stage. Paint re-parameterises the mesh and splits
-            # vertices along UV seams, so that line understates what actually
-            # reached disk. Read the file instead, and keep the parsed values
-            # as a fallback so this can never return null.
-            info = await asyncio.to_thread(_mesh_counts, dst)
-            if info.get("verts") is not None:
-                verts, faces = info["verts"], info["faces"]
+                raise RuntimeError("shape generation failed (exit %d):\n%s"
+                                   % (rc, (se or so)[-2000:]))
+            stats = _engine_json(so)
+            stages.append("shape")
+            if stats.get("raw_faces") and stats.get("faces") \
+                    and stats["faces"] < stats["raw_faces"]:
+                stages.append("decimate (%d -> %d)"
+                              % (stats["raw_faces"], stats["faces"]))
     finally:
         with _queue_guard:
             _queue_depth -= 1
 
     seconds = time.monotonic() - started
     _record_job("generate_model", src.name, True, seconds)
-    out = {"glb_path": str(dst), "verts": verts, "faces": faces,
+    out = {"glb_path": str(dst), "verts": stats.get("vertices"),
+           "faces": stats.get("faces"), "raw_faces": stats.get("raw_faces"),
+           "watertight": stats.get("watertight"),
+           "attributes": stats.get("glb_attributes"),
+           "peak_reserved_gib": stats.get("peak_torch_reserved_gib"),
+           "vram_ceiling_gib": stats.get("free_at_baseline_gib"),
            "seconds": round(seconds, 1), "stages": stages,
+           "textured": False,
            "progress": "streamed" if streamed else "unavailable"}
-    if warning:
-        out["warning"] = warning
+    if stats.get("warning"):
+        out["warning"] = stats["warning"]
     return out
 
 
 @mcp.tool
-async def paint_mesh(
-    mesh_path: str,
-    image_path: str,
-    output_path: str | None = None,
-    texture_size: int = 2048,
-    paint_res: int | None = None,
-    paint_steps: int | None = None,
-    superres: bool = True,
-    auto_cutout: bool = True,
-    finish: bool = False,
-    normals: bool = True,
-    ctx: Context | None = None,
-) -> dict:
-    """Texture an existing mesh from a concept image. Geometry untouched.
+def paint_mesh(mesh_path: str, image_path: str,
+               output_path: str | None = None) -> dict:
+    """Unavailable on this build — texturing needs more VRAM than the card has.
 
-    The paint half of generate_model, reachable on its own: it takes a mesh
-    you already have and bakes a PBR texture onto it. Two things that buys —
-    re-texturing at different knobs without paying for the shape pass again,
-    and texturing geometry this engine did not produce (a blockout, a
-    multiview reconstruction, anything the modeller hands you).
+    Kept as a tool so the failure is a sentence rather than an unknown-tool
+    error: Hunyuan3D's paint pipeline runs multiview diffusion at a peak
+    well past a consumer 8GB card, and the WSL2 failure mode is not a clean
+    OOM but a silent spill into host RAM that runs at PCIe bandwidth. Half
+    of it would appear to work and take an hour.
 
-    mesh_path: .glb, .gltf and .obj are loaded directly; anything else goes
-    through ModelIO and may or may not work, so it is reported as a warning
-    rather than refused.
-    image_path: the conditioning image, under the same rules as
-    generate_model — single object, three-quarter view, evenly lit, plain
-    background. It drives the texture only; it cannot move a vertex, so a
-    mismatch against the mesh shows up as smeared projection.
-    auto_cutout keys out a plain background first unless the image already
-    carries real transparency. Leave it on: the paint pipeline composites
-    alpha over white but does no keying of its own, so an unkeyed gray
-    backdrop is conditioning the texture rather than being ignored.
-    finish=True applies the game-look pass afterwards (see finish_model).
-    Blocks while an earlier job is running (single-job queue).
-
-    No seed: the paint pipeline re-seeds to 0 internally, so the same mesh
-    and image reproduce the same texture. Re-running is free of variance,
-    and rerolling is not an option the way it is on shape.
-
-    Knobs, each defaulting to None so the binary's own default (in parens)
-    applies:
-
-      paint_res (512)   resolution the multiview texture diffusion runs
-                        at — the sharpness lever.
-      paint_steps (15)  texture diffusion steps.
-
-    texture_size: 512|1024|2048|4096. The engine's own pbr default is 4096;
-    2048 here matches generate_model and keeps peak memory modest.
-    superres=False skips the texture super-resolution pass.
+    Texture the GLB downstream instead — Blender, Substance, or Godot's own
+    material tools — or run the paint stage on a larger GPU.
     """
-    global _queue_depth
-    mesh = Path(mesh_path).expanduser()
-    src = Path(image_path).expanduser()
-    if not mesh.is_file():
-        raise ValueError("mesh not found: %s" % mesh)
+    raise RuntimeError(
+        "paint_mesh is unavailable: this server generates shape only. The "
+        "GLB has normals but no UVs or material; texture it downstream, or "
+        "run Hunyuan3D's paint pipeline on a GPU with more VRAM.")
+
+
+@mcp.tool
+def export_stl(
+    glb_path: str,
+    output_path: str | None = None,
+    height_mm: float = 120.0,
+    min_wall_mm: float = 0.8,
+) -> dict:
+    """Convert a generated GLB into an STL a slicer will accept.
+
+    Two conversions that are not optional, both silent failures if skipped.
+    STL carries no units and every slicer reads it as millimetres, so the
+    engine's roughly-unit-box mesh would arrive as a 2mm trinket — hence
+    height_mm, measured along the print Z axis. And glTF is Y-up while
+    slicers are Z-up, so an unrotated export lands on its side.
+
+    Also drops the model onto z=0 so it sits on the plate, centres it, and
+    reports the manifold checks that decide whether it slices at all.
+
+    Read bbox_fill_pct in the result, not just the checks. A thin hollow
+    shell and a solid can both be watertight, single-body and genus 0 with
+    identical silhouettes; the enclosed volume is what separates them, and
+    no preview render will show you the difference. Under ~15% means walls
+    thin enough that the slicer may drop them.
+    min_wall_mm warns when the finest detail present falls under roughly two
+    perimeters of a 0.4mm nozzle.
+    """
+    src = Path(glb_path).expanduser().resolve()
     if not src.is_file():
-        raise ValueError("input image not found: %s" % src)
-    try:
-        with Image.open(src) as im:
-            im.verify()
-    except Exception as e:
-        raise ValueError("input is not a readable image: %s (%s)" % (src, e))
-    if texture_size not in (512, 1024, 2048, 4096):
-        raise ValueError("texture_size must be 512, 1024, 2048 or 4096")
-    for name, val in (("paint_res", paint_res), ("paint_steps", paint_steps)):
-        if val is not None and val < 1:
-            raise ValueError("%s must be a positive integer" % name)
-
-    dst = _out_path(mesh.stem + "-painted", ".glb", output_path)
-    if dst.resolve() == mesh.resolve():
-        raise ValueError("output would overwrite the input mesh (%s) — the "
-                         "engine reads it while writing, so give a different "
-                         "output_path" % dst)
-
-    stages: list[str] = []
-    warning: str | None = None
-    if mesh.suffix.lower() not in (".glb", ".gltf", ".obj"):
-        warning = ("%s is outside the formats the engine loads directly "
-                   "(.glb/.gltf/.obj); it falls back to ModelIO, which may "
-                   "not handle it" % (mesh.suffix or "a missing extension"))
+        raise ValueError("GLB not found: %s" % src)
+    if height_mm <= 0:
+        raise ValueError("height_mm must be positive")
+    dst = _out_path(src.stem, ".stl", output_path)
     started = time.monotonic()
-    with _queue_guard:
-        _queue_depth += 1
-    try:
-        async with _job_lock:
-            gen_input = src
-            if auto_cutout and not _has_real_alpha(src):
-                rgba = HY3D_OUT / "intermediate" / (src.stem + "-rgba.png")
-                cut = await asyncio.to_thread(
-                    _run_worker, "cutout.py", [str(src), str(rgba)])
-                gen_input = Path(cut["png_path"])
-                stages.append("cutout (%.1f%% opaque)" % cut["opaque_pct"])
-
-            # The paint subcommand names its flags differently from generate:
-            # --weights (the paint root, not the checkpoint), --model, and
-            # --steps, which here means paint steps — on generate that same
-            # flag is the shape steps.
-            cmd = [str(BINARY), "paint", str(mesh), str(gen_input),
-                   "-o", str(dst),
-                   "--weights", "weights/paint-large",
-                   "--model", "pbr", "--tex", str(texture_size)]
-            if paint_steps is not None:
-                cmd += ["--steps", str(paint_steps)]
-            if paint_res is not None:
-                cmd += ["--res", str(paint_res)]
-            if not superres:
-                cmd.append("--no-superres")
-            env = os.environ | {"METAL_PATH": str(METALLIB_DIR),
-                                "MLX_METAL_PATH": str(METALLIB_DIR)}
-            rc, so, se, streamed = await _run_engine(
-                cmd, env, ctx, False, stage="paint")
-            if rc != 0 or not dst.is_file():
-                _record_job("paint_mesh", mesh.name, False,
-                            time.monotonic() - started)
-                raise RuntimeError("hy3d paint failed (exit %d):\n%s"
-                                   % (rc, (se or so)[-2000:]))
-            stages.append("paint")
-
-            if finish:
-                fin = await asyncio.to_thread(
-                    _run_worker, "finish.py", [str(dst), str(dst)])
-                stages.append("finish (%.1f%% accents)"
-                              % fin["accent_coverage_pct"])
-
-            if normals:
-                # Last: finish.py round-trips through trimesh, which would
-                # drop the attribute again if it were injected before.
-                nrm = await asyncio.to_thread(_add_normals, dst)
-                if nrm.get("normals_added"):
-                    stages.append("normals (%d)" % nrm["count"])
-                elif nrm.get("warning"):
-                    warning = nrm["warning"]
-
-            # Paint prints no vert/face line at all, so unlike generate_model
-            # there is nothing to parse and the file is the only source.
-            info = await asyncio.to_thread(_mesh_counts, dst)
-    finally:
-        with _queue_guard:
-            _queue_depth -= 1
-
-    seconds = time.monotonic() - started
-    _record_job("paint_mesh", mesh.name, True, seconds)
-    out = {"glb_path": str(dst), "verts": info.get("verts"),
-           "faces": info.get("faces"), "seconds": round(seconds, 1),
-           "stages": stages,
-           "progress": "streamed" if streamed else "unavailable"}
-    if warning:
-        out["warning"] = warning
+    out = _run_worker("tostl.py", [str(src), str(dst),
+                                   "--height", str(height_mm),
+                                   "--min-wall", str(min_wall_mm)])
+    _record_job("export_stl", src.name, True, time.monotonic() - started)
     return out
 
 
@@ -591,9 +470,15 @@ def prepare_concept(image_path: str, output_path: str | None = None) -> dict:
 
     Standalone version of generate_model's auto_cutout, for callers that
     want the intermediate. Refuses inputs whose corners disagree (busy
-    background). Warns when the opaque fraction looks like a bad key.
+    background) rather than shredding them. Warns when the opaque fraction
+    looks like a bad key.
+
+    A refusal here does not block generation: generate_model falls back to
+    the engine venv's rembg, which handles painted concept art this
+    corner-sampling key cannot. Reach for this tool when you want to see and
+    check the cutout, not as a required first step.
     """
-    src = Path(image_path).expanduser()
+    src = Path(image_path).expanduser().resolve()
     if not src.is_file():
         raise ValueError("input image not found: %s" % src)
     dst = _out_path(src.stem + "-rgba", ".png", output_path)
@@ -622,7 +507,12 @@ def finish_model(
     seam_halo: float = 0.10,
     normals: bool = True,
 ) -> dict:
-    """Apply the game-look texture pass to a generated GLB. Geometry untouched.
+    """Apply the game-look texture pass to a GLB that already has a texture.
+
+    Not reachable from this server's own output: shape-only generation
+    produces no albedo map for this to tone, so calling it on a fresh
+    generate_model result fails. It stays available for GLBs textured
+    elsewhere and round-tripped back through here.
 
     Tones the albedo (gamma/contrast/saturation), extracts saturated accents
     and blackhat panel seams into a dedicated glTF emissive texture.
@@ -638,7 +528,7 @@ def finish_model(
     rewrite, which would otherwise drop it. Geometry is still untouched:
     normals are derived from the vertex positions already in the file.
     """
-    src = Path(glb_path).expanduser()
+    src = Path(glb_path).expanduser().resolve()
     if not src.is_file():
         raise ValueError("GLB not found: %s" % src)
     dst = _out_path(src.stem + "-finished", ".glb", output_path)
@@ -669,20 +559,19 @@ def render_preview(glb_path: str, views: list[str] | None = None,
 
     views: subset of iso/front/back/top/side (default [iso]).
 
-    Rasterising needs pyrender. Its usual failure here is not the window
-    server but pyopengl: every pyrender release pins pyopengl==3.1.0, whose
-    glGenTextures wrapper raises "No array-type handler for type
-    _ctypes.type" against modern numpy. That path is only reached for
-    TEXTURED meshes, so an untextured render succeeds and makes the venv
-    look healthy while every painted GLB fails. install.sh overrides the pin
-    afterwards, and `server_status`'s preview_ok flags a venv still on 3.1.0.
+    Rasterising needs pyrender, and headless it needs an EGL context —
+    PYOPENGL_PLATFORM=egl, falling back to software rendering when the WSL
+    device node is not reachable. The pyopengl pin (3.1.0, whose
+    glGenTextures wrapper breaks against modern numpy) only bites on
+    TEXTURED meshes, so it does not affect this server's own untextured
+    output; `server_status`'s preview_ok flags it anyway for GLBs from
+    elsewhere.
 
-    When it fails for any reason this falls back to the contact sheets the
-    paint pass wrote beside the GLB and says so in `source`, since those are
-    fixed views, not the ones requested. Only the paint pass writes them, so
-    shape-only output has no fallback.
+    A preview tells you about silhouette and form, and nothing about whether
+    the mesh is solid. Two models that render identically can differ 5x in
+    enclosed volume — export_stl's bbox_fill_pct is where that shows up.
     """
-    src = Path(glb_path).expanduser()
+    src = Path(glb_path).expanduser().resolve()
     if not src.is_file():
         raise ValueError("GLB not found: %s" % src)
     outdir = HY3D_OUT / "previews"
@@ -716,109 +605,152 @@ def _check(ok: bool, fix: str) -> dict:
     return {"ok": ok} if ok else {"ok": False, "fix": fix}
 
 
+def _probe(python: Path, code: str, timeout: float = 120.0):
+    """Run a probe snippet under another interpreter; None if it cannot run."""
+    if not python.is_file():
+        return None
+    try:
+        return subprocess.run([str(python), "-c", code], capture_output=True,
+                              text=True, timeout=timeout)
+    except Exception:
+        return None
+
+
 def _server_status() -> dict:
-    binary = _check(
-        BINARY.is_file() and os.access(BINARY, os.X_OK),
-        "run the setup_engine tool, or build it directly: "
-        "cd %s && swift build -c release" % HY3D_REPO)
+    repo = _check(
+        (ENGINE_REPO / "hy3dgen" / "shapegen").is_dir(),
+        "Hunyuan3D-2 checkout not found at %s — run "
+        "`bash scripts/provision-engine.sh`, or set HY3D_ENGINE_REPO to an "
+        "existing checkout" % ENGINE_REPO)
 
-    metallib = _check(
-        (METALLIB_DIR / "default.metallib").is_file()
-        and (BUILD_REAL / "default.metallib").is_file(),
-        "swift build never emits the MLX metallib (mlx-swift SwiftPM "
-        "limitation). Run the setup_engine tool, or by hand: pip mlx and "
-        "mlx-swift are separate version series, so install the newest pip "
-        "mlx sharing Package.resolved's major.minor — mlx-swift 0.31.4 "
-        "means `uv pip install mlx==0.31.2`, as there is no pip 0.31.4 — "
-        "then copy "
-        "site-packages/mlx/lib/mlx.metallib as BOTH mlx.metallib and "
-        "default.metallib into %s AND into %s (the real build dir — "
-        ".build/release is a symlink)" % (METALLIB_DIR, BUILD_REAL))
+    engine_ok = False
+    engine_fix = ("engine venv not found at %s — run "
+                  "`bash scripts/provision-engine.sh`" % ENGINE_PY)
+    cuda: dict = {"ok": False, "fix": "engine venv missing, so CUDA is unverified"}
+    # One probe covers both: the imports the driver needs, and whether torch
+    # can actually see the card. A CPU-only wheel imports perfectly and then
+    # runs the job at a hundredth of the speed, so torch importing is not the
+    # check that matters.
+    probe = _probe(ENGINE_PY,
+                   "import torch, trimesh, pygltflib, skimage, pymeshlab, rembg\n"
+                   "print('CORE_OK')\n"
+                   "print('CUDA', torch.cuda.is_available(), torch.version.cuda)\n"
+                   "if torch.cuda.is_available():\n"
+                   "    f, t = torch.cuda.mem_get_info()\n"
+                   "    print('VRAM', torch.cuda.get_device_name(0), f, t)\n")
+    if probe is not None:
+        engine_ok = "CORE_OK" in probe.stdout
+        if not engine_ok:
+            engine_fix = (
+                "engine venv at %s is missing packages: %s — re-run "
+                "`bash scripts/provision-engine.sh`, which installs them in "
+                "the order that matters (torch from the cu124 index, numpy<2, "
+                "and scikit-image, which upstream needs for marching cubes "
+                "but does not declare)"
+                % (ENGINE_PY, probe.stderr.strip()[-300:]))
+        line = next((l for l in probe.stdout.splitlines()
+                     if l.startswith("CUDA ")), "")
+        if line.startswith("CUDA True"):
+            vram = next((l for l in probe.stdout.splitlines()
+                         if l.startswith("VRAM ")), "")
+            cuda = {"ok": True}
+            if vram:
+                *name, free, total = vram[5:].rsplit(" ", 2)
+                cuda["device"] = " ".join(name)
+                cuda["free_gib"] = round(int(free) / 1024 ** 3, 2)
+                cuda["total_gib"] = round(int(total) / 1024 ** 3, 2)
+                if cuda["free_gib"] < 5.0:
+                    cuda["warning"] = (
+                        "only %.2f GiB free — something else is holding VRAM. "
+                        "On WSL2 an oversized job does not fail, it spills "
+                        "into host RAM and crawls, so free this up or expect "
+                        "a very slow run" % cuda["free_gib"])
+        elif engine_ok:
+            cuda = {"ok": False, "fix":
+                    "torch imports but reports no CUDA device. Never install "
+                    "an NVIDIA driver inside WSL — the Windows driver is "
+                    "projected in. Check that /usr/lib/wsl/lib is on the "
+                    "loader path, and that the venv has the cu124 torch build "
+                    "rather than the CPU wheel (`%s -c \"import torch; "
+                    "print(torch.__version__)\"` should end in +cu124)"
+                    % ENGINE_PY}
 
-    weights_root = HY3D_REPO / "weights"
+    driver = _check(ENGINE_CLI.is_file(),
+                    "engine driver missing at %s — reinstall the server "
+                    "package" % ENGINE_CLI)
+
+    # Weights live in the HF cache, not the checkout: the driver names a repo
+    # id and lets huggingface_hub resolve it. Absent means a ~5GB download on
+    # first generate, which is worth knowing before a call appears to hang.
+    hf = Path(os.environ.get("HF_HOME", Path.home() / ".cache/huggingface"))
+    cached = list((hf / "hub").glob("models--tencent--Hunyuan3D-2*")) \
+        if (hf / "hub").is_dir() else []
     weights = _check(
-        (weights_root / "shape-small").is_dir()
-        and (weights_root / "paint-large").is_dir(),
-        "run the setup_engine tool, or download the model weights (~12GB) "
-        "into %s/{shape-small,paint-large} yourself per the Hunyuan3D-MLX "
-        "README" % weights_root)
-
-    paint = weights_root / "paint-large"
-    needed = [paint / "hunyuan3d-paint-v2-0" / "vae",
-              paint / "hunyuan3d-paint-v2-0" / "unet",
-              paint / "hunyuan3d-paintpbr-v2-1" / "vae",
-              paint / "hunyuan3d-paintpbr-v2-1" / "unet",
-              paint / "dinov2-giant"]
-    layout = _check(
-        all(p.exists() for p in needed),
-        "the paint-large HF repo ships flat but the binary expects nested "
-        "paths. Inside %s run: mkdir -p hunyuan3d-paint-v2-0 "
-        "hunyuan3d-paintpbr-v2-1 && ln -s ../vae ../unet "
-        "hunyuan3d-paint-v2-0/ && ln -s ../vae ../unet "
-        "hunyuan3d-paintpbr-v2-1/ && ln -s dinov2 dinov2-giant" % paint)
+        bool(cached),
+        "no Hunyuan3D weights in the HF cache at %s — the first generate_model "
+        "call will download ~5GB before it starts, which looks like a hang. "
+        "Pre-fetch it, or just budget for the first call being long" % (hf / "hub"))
 
     venv_ok = False
-    venv_fix = ("worker venv missing: run the setup_engine tool, or set "
-                "HY3D_PY to a python with cv2/numpy/trimesh/PIL/scipy/"
+    venv_fix = ("worker venv missing: run `bash scripts/provision-engine.sh`, "
+                "or set HY3D_PY to a python with cv2/numpy/trimesh/PIL/scipy/"
                 "pygltflib")
     preview_ok = False
     preview_fix = "worker venv missing, so render_preview cannot rasterise"
-    if HY3D_PY.is_file():
-        # One probe for both: pyopengl is reported separately from the core
-        # imports so a broken preview never marks generation unhealthy.
-        probe = subprocess.run(
-            [str(HY3D_PY), "-c",
-             "import cv2, numpy, trimesh, PIL, scipy, pygltflib\n"
-             "print('CORE_OK')\n"
-             "try:\n"
-             "    import pyrender, OpenGL\n"
-             "    print('GL', OpenGL.__version__)\n"
-             "except Exception as e:\n"
-             "    print('GL_ERR', type(e).__name__, e)\n"],
-            capture_output=True, text=True, timeout=60.0)
-        venv_ok = "CORE_OK" in probe.stdout
+    wprobe = _probe(HY3D_PY,
+                    "import cv2, numpy, trimesh, PIL, scipy, pygltflib\n"
+                    "print('CORE_OK')\n"
+                    "try:\n"
+                    "    import pyrender, OpenGL\n"
+                    "    print('GL', OpenGL.__version__)\n"
+                    "except Exception as e:\n"
+                    "    print('GL_ERR', type(e).__name__, e)\n", timeout=60.0)
+    if wprobe is not None:
+        venv_ok = "CORE_OK" in wprobe.stdout
         if not venv_ok:
             # uv, not `python -m pip`: uv-created venvs ship without pip, so
             # the pip form fails with "No module named pip" on a stock setup.
             venv_fix = ("worker venv at %s is missing packages: %s — install "
                         "them with `uv pip install --python %s opencv-python "
-                        "numpy trimesh pillow scipy pygltflib`, or run the "
-                        "setup_engine tool"
-                        % (HY3D_PY, probe.stderr.strip()[-300:], HY3D_PY))
+                        "numpy trimesh pillow scipy pygltflib`"
+                        % (HY3D_PY, wprobe.stderr.strip()[-300:], HY3D_PY))
 
         gl = next((ln.split(None, 1)[1].strip()
-                   for ln in probe.stdout.splitlines()
+                   for ln in wprobe.stdout.splitlines()
                    if ln.startswith("GL ")), None)
-        # 3.1.0 is what pyrender pins, and its glGenTextures wrapper cannot bind
-        # a texture against modern numpy. Untextured renders still work, so this
-        # is invisible until the first painted GLB. Same floor install.sh
-        # applies, so the diagnostic and the repair cannot disagree.
+        # 3.1.0 is what pyrender pins, and its glGenTextures wrapper cannot
+        # bind a texture against modern numpy. This build produces untextured
+        # meshes, so it does not block previews here — but it would bite the
+        # moment a textured GLB from elsewhere is rendered.
         if gl is not None:
             parts = tuple(int("".join(c for c in p if c.isdigit()) or 0)
                           for p in gl.split(".")[:3])
             preview_ok = parts >= (3, 1, 7)
         if gl is None:
-            preview_fix = ("pyrender/pyopengl not importable under %s, so "
-                           "render_preview falls back to the paint pass's "
-                           "contact sheets — install with `uv pip install "
-                           "--python %s pyrender` then apply the pin override "
-                           "below" % (HY3D_PY, HY3D_PY))
+            preview_fix = ("pyrender/pyopengl not importable under %s — "
+                           "install with `uv pip install --python %s pyrender` "
+                           "then apply the pin override below. Headless "
+                           "rendering also needs PYOPENGL_PLATFORM=egl"
+                           % (HY3D_PY, HY3D_PY))
         elif not preview_ok:
             preview_fix = ("pyopengl is %s; below 3.1.7 it cannot render "
-                           "textured meshes, so render_preview falls back to "
-                           "contact sheets for every painted GLB (generation "
-                           "is unaffected). Fix with `uv pip install --python "
-                           "%s --upgrade 'PyOpenGL>=3.1.7'` — resolving it "
-                           "alongside pyrender fails, so it must be a separate "
-                           "upgrade" % (gl, HY3D_PY))
+                           "textured meshes. This server's own output is "
+                           "untextured so previews still work, but a textured "
+                           "GLB from elsewhere would fail. Fix with `uv pip "
+                           "install --python %s --upgrade 'PyOpenGL>=3.1.7'` — "
+                           "resolving it alongside pyrender fails, so it must "
+                           "be a separate upgrade" % (gl, HY3D_PY))
 
     return {
-        "binary_ok": binary, "metallib_ok": metallib, "weights_ok": weights,
-        "layout_ok": layout, "venv_ok": _check(venv_ok, venv_fix),
+        "engine_repo_ok": repo, "engine_venv_ok": _check(engine_ok, engine_fix),
+        "cuda_ok": cuda, "driver_ok": driver, "weights_cached": weights,
+        "venv_ok": _check(venv_ok, venv_fix),
         "preview_ok": _check(preview_ok, preview_fix),
+        "textured_output": False,
         "queue_depth": _queue_depth, "last_job": _last_job,
-        "config": {"HY3D_REPO": str(HY3D_REPO), "HY3D_PY": str(HY3D_PY),
-                   "HY3D_OUT": str(HY3D_OUT)},
+        "config": {"HY3D_ENGINE_REPO": str(ENGINE_REPO),
+                   "HY3D_ENGINE_PY": str(ENGINE_PY),
+                   "HY3D_PY": str(HY3D_PY), "HY3D_OUT": str(HY3D_OUT)},
     }
 
 
@@ -846,73 +778,35 @@ async def cancel_job() -> dict:
 def server_status() -> dict:
     """Health check and first-run diagnostic.
 
-    Validates every setup requirement (binary, metallib, weights, weight
-    layout, worker venv); each failing check carries the exact fix. Also
-    reports queue depth and the last job.
+    Validates every setup requirement — the Hunyuan3D-2 checkout, the engine
+    venv, that torch actually sees the GPU, the driver script, whether the
+    weights are already cached, and the worker venv — and each failing check
+    carries the exact fix. Also reports queue depth and the last job.
+
+    Worth reading even when everything passes: cuda_ok reports free VRAM,
+    and on WSL2 a job that does not fit does not fail, it spills into host
+    RAM and runs at PCIe speed.
     """
     return _server_status()
 
 
 @mcp.tool
-async def setup_engine(
-    confirm: bool = False,
-    only: int | None = None,
-    repo: str | None = None,
-    worker_venv: str | None = None,
-) -> dict:
-    """Install or repair the Hunyuan3D-MLX engine this server shells out to.
+def setup_engine(confirm: bool = False, only: int | None = None) -> dict:
+    """Not automated yet on this platform — returns the command to run.
 
-    Runs the bundled install.sh: checkout, swift build, metallib harvest,
-    ~12GB weight download, paint-large relayout, worker venv. Every phase
-    inspects before acting, so re-running after a failure resumes.
-
-    Defaults to a DRY RUN — it reports the plan and changes nothing. Show
-    that plan to the user, and only re-call with confirm=True once they
-    have agreed: applying costs a ~4 minute build and a ~12GB download.
-    only=N runs a single phase (1 preflight, 2 clone, 3 build, 4 metallib,
-    5 weights, 6 layout, 7 worker venv). Blocks generation while it runs.
+    The CUDA provisioner exists as `scripts/provision-engine.sh` and is
+    idempotent, but it does not yet speak the phase-by-phase, dry-run-first
+    protocol this tool's contract promises, and a half-honoured contract is
+    worse than an honest pointer. Wiring it up is the next phase of the
+    port.
     """
-    global _queue_depth
-    if not INSTALLER.is_file():
-        raise RuntimeError("installer not found at %s" % INSTALLER)
-    if only is not None and not 1 <= only <= 7:
-        raise ValueError("only must be a phase number from 1 to 7")
-
-    argv = [str(INSTALLER), "--yes" if confirm else "--plan"]
-    if only is not None:
-        argv += ["--only", str(only)]
-    if repo:
-        argv += ["--repo", str(Path(repo).expanduser())]
-    if worker_venv:
-        argv += ["--worker-venv", str(Path(worker_venv).expanduser())]
-
-    started = time.monotonic()
-    with _queue_guard:
-        _queue_depth += 1
-    try:
-        async with _job_lock:
-            proc = await asyncio.to_thread(
-                subprocess.run, ["/bin/bash"] + argv, capture_output=True,
-                text=True, timeout=SETUP_TIMEOUT)
-    finally:
-        with _queue_guard:
-            _queue_depth -= 1
-
-    seconds = time.monotonic() - started
-    ok = proc.returncode == 0
-    _record_job("setup_engine", "plan" if not confirm else "apply", ok, seconds)
-    out = (proc.stdout or "") + (proc.stderr or "")
-    result = {"mode": "plan" if not confirm else "apply", "ok": ok,
-              "seconds": round(seconds, 1), "output": out.strip()[-6000:]}
-    if not confirm:
-        result["next"] = ("nothing was executed. Relay this plan to the user; "
-                          "re-call with confirm=True only once they agree to "
-                          "the build and the ~12GB download.")
-    else:
-        result["next"] = ("call server_status to verify" if ok else
-                          "setup did not finish; the output says which phase "
-                          "failed. Re-calling resumes from there.")
-    return result
+    raise RuntimeError(
+        "automated setup is not wired up on the CUDA build yet. Run this in a "
+        "shell from the repo root, then call server_status:\n\n"
+        "    bash scripts/provision-engine.sh\n\n"
+        "It clones Hunyuan3D-2, builds the engine venv with the cu124 torch "
+        "wheels, and is safe to re-run — it inspects before acting. Note it "
+        "needs the system package `libopengl0` for pymeshlab's mesh IO.")
 
 
 def main() -> None:

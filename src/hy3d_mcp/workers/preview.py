@@ -7,8 +7,18 @@ pyrender for the actual raster. Prints one JSON line on stdout:
 import argparse
 import json
 import math
+import os
 import sys
 from pathlib import Path
+
+# Must be set before pyrender is imported, which happens inside main(): the
+# platform is read at import time to pick a context backend. Headless Linux
+# has no display for the default pyglet backend, and pyrender's failure
+# there is not "no display" but the far less obvious "Attempt to retrieve
+# context when no valid context" from deep inside the draw call. EGL gets a
+# context with no window; under WSL it falls back to software rendering when
+# the DRI device node is not reachable, which is slow but correct.
+os.environ.setdefault("PYOPENGL_PLATFORM", "egl")
 
 VIEWS = {
     "iso": (1.0, 0.6, 1.0),

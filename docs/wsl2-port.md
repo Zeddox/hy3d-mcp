@@ -203,3 +203,84 @@ Note that upstream's `minimal_demo.py` converts the input to RGBA and *then*
 tests `image.mode == 'RGB'` to decide whether to run background removal, so its
 background removal never runs. Test the source image's mode before converting,
 and treat an all-opaque alpha channel as no alpha.
+
+## Phase 2: what the fork-and-swap actually touched
+
+The MCP layer survived the platform change almost intact. What changed was
+the bottom of it — the process the server spawns — and the honesty of what
+sits on top.
+
+**The swap itself.** `generate_model` used to build argv for a Swift
+binary and hand it a Metal library through the environment. It now builds
+argv for `engine_cli.py` under the engine venv's interpreter, invoked by
+absolute path. The driver lives inside the package rather than in
+`scripts/` for one concrete reason: a wheel carries no repo root, so
+anything the server needs to locate at runtime has to ship beside it.
+
+**The progress protocol did not change, and that was the point.** The
+server parses `[ NN%] message` lines off the child's stdout and relays them
+as MCP progress notifications, with a heartbeat underneath so a slow job
+and a hung one do not look identical to the client. Upstream's pipeline
+supports a `callback` — undocumented and unused by its own demos — so the
+new driver emits exactly the lines the existing parser already understood.
+Two details matter:
+
+* `callback_steps=1` is mandatory, not advisory. The loop evaluates
+  `i % callback_steps` whenever a callback is set, and the default `None`
+  makes that a `TypeError` on the first step.
+* The budget has to be lopsided. Diffusion owns 8–40% and volume decoding
+  40–95%, because decoding is roughly twice diffusion's wall-clock at
+  octree 384. Giving diffusion the whole bar would park it at 100% for the
+  majority of the job — precisely the "slow job looks hung" case the
+  heartbeat exists to prevent.
+
+**Absolute paths are load-bearing.** The engine child runs with `cwd` set
+to the Hunyuan3D checkout so its own imports resolve. Any relative path
+handed in by a caller therefore resolves against the checkout, not the
+user's directory. Every tool now resolves input and output paths before
+they reach a subprocess.
+
+**One venv, not two.** The Apple build separated a worker venv from the
+engine so mesh and image work would not load MLX. `provision-engine.sh`
+already builds an environment carrying numpy, PIL, trimesh, scipy, cv2,
+pygltflib and pyrender, so `HY3D_PY` now defaults to the engine venv.
+The split stays available through the env var; it just no longer names a
+venv that nothing creates.
+
+**Headless rendering needs `PYOPENGL_PLATFORM=egl` set before pyrender is
+imported.** The platform is read at import time. Without it on headless
+Linux, pyrender does not fail with anything resembling "no display" — it
+fails with `Attempt to retrieve context when no valid context` from deep
+inside the draw call, which reads as a corrupt mesh rather than a missing
+context.
+
+**Tools that cannot work now say so.** `paint_mesh` raises a sentence
+explaining that texturing needs more VRAM than the card has, rather than
+being removed (an unknown-tool error teaches the caller nothing) or left to
+fail obscurely. `setup_engine` returns the one command to run instead of
+half-honouring a contract — dry-run-first, seven resumable phases — that
+`provision-engine.sh` does not yet implement. `finish_model` still works,
+but only on GLBs textured elsewhere and round-tripped back through.
+
+**The skill had to change with the server.** `SKILL.md` described the
+pipeline as "shape + PBR paint" and told the agent never to decimate. With
+texturing gone and `max_faces` defaulting to 40k, an unrevised skill would
+have had the agent promising colour it would not get and refusing a step
+the server now performs by default. A swap that leaves the caller's
+instructions describing the old engine is not finished.
+
+### Measured, end to end through the MCP tool
+
+Concept `pagoda-clean.png`, defaults, seed 42:
+
+| | |
+|---|---|
+| wall clock | 185s (of which ~35s model load, ~115s generate, ~11s decimate) |
+| raw faces | 546,196 |
+| after decimation | 40,000 faces / 20,002 verts, still watertight |
+| peak reserved | 6.22 GiB against a 6.96 GiB ceiling |
+| GLB attributes | `POSITION`, `NORMAL` |
+| STL at 120mm | 59.5 × 59.2 × 120.0 mm, 101.5 cm³, 24.0% of bounding box |
+
+The model reloads on every call — each generation is a fresh subprocess —
+so ~35s of that 185s is fixed overhead per job, not per session.

@@ -1,6 +1,6 @@
 [project]
 name = "hy3d-mcp"
-version = "0.4.1"
+version = "0.5.0"
 description = "MCP server wrapping the local Hunyuan3D-MLX image-to-3D pipeline: concept image in, textured GLB out"
 readme = "README.md"
 requires-python = ">=3.12"
@@ -22,6 +22,6 @@ build-backend = "hatchling.build"
 [tool.hatch.build.targets.wheel]
 packages = ["src/hy3d_mcp"]
 
-# A wheel carries no repo root, so setup_engine could not find the installer.
-[tool.hatch.build.targets.wheel.force-include]
-"install.sh" = "hy3d_mcp/install.sh"
+# No force-include: install.sh is the macOS installer and nothing reads it
+# now that setup_engine points at scripts/provision-engine.sh by name. The
+# CUDA installer gets wired up (and shipped) in the next phase of the port.
