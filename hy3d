@@ -106,16 +106,26 @@ sys.exit(1 if failed else 0)
 PY
 )"
     rc=$?
-    local line kind name detail
+    local kind name detail seen=0
     while IFS=$'\t' read -r kind name detail; do
         case "$kind" in
-            OK)     ok "$name$detail" ;;
-            WARN)   warn "$name — $detail" ;;
-            BAD)    bad "$name — $detail" ;;
+            OK)     ok "$name$detail"; seen=$((seen + 1)) ;;
+            WARN)   warn "$name — $detail"; seen=$((seen + 1)) ;;
+            BAD)    bad "$name — $detail"; seen=$((seen + 1)) ;;
             CONFIG) say "  ${DIM}engine: $name${RST}"; say "  ${DIM}output: $detail${RST}" ;;
+            # Anything else is the probe's own traceback, printed rather than
+            # hidden: a status call that dies has more to say than "failed".
             *)      [ -n "$kind$name$detail" ] && say "  $kind$name$detail" ;;
         esac
     done <<< "$out"
+    # No check lines at all is a broken probe, not a clean bill of health --
+    # an import that died, or a rename that emptied the dict. It would
+    # otherwise pass silently, which is the one failure nobody would notice.
+    if [ "$seen" = 0 ]; then
+        bad "the status probe reported no checks — run it directly to see why:
+          $PY -c 'from hy3d_mcp.server import _server_status; print(_server_status())'"
+        return 1
+    fi
     if [ "$rc" != 0 ]; then
         say ""
         say "${RED}the engine is not ready${RST} — most of the fixes above are one command:"
