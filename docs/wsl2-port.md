@@ -461,3 +461,26 @@ One thing the plan did not have: `?glb=/files/<name>.glb`. It exists because a
 reload should keep the mesh you were looking at, and it is also what made the
 viewer verifiable without a browser — headless Chrome with software WebGL,
 pointed at that URL, renders the lantern.
+
+**The cancel button lied, and a real test caught it.** `cancel_job` kills
+`_current_proc`, a module global — correct for an MCP server where one client
+owns the session, wrong the moment a job registry exists. Cancelling a job
+that was still *queued* killed the job that was *running*: the first attempt
+returned `{"killed": true, "pid": 57579}` and the running job died with
+`exit -9`. The workbench now never calls that tool; it cancels its own
+`asyncio.Task`, and `_run_engine`'s `except asyncio.CancelledError: proc.kill()`
+kills that job's engine and no other. The button also names which of the three
+things happened, because they are not the same event:
+
+    queued job cancelled  -> "dropped while it waited for the GPU — no engine
+                              of this job had started"        (engine: false)
+    running job cancelled -> "engine killed; the GPU frees once the job
+                              unwinds"                        (engine: true)
+    settled job cancelled -> "that job is already done"    (cancelled: false)
+
+All three were exercised against a live GPU, along with the case the flock
+exists for: an MCP-side process holding the lock printed
+`waiting for the GPU — another hy3d process is generating (0m00s)` for 31s and
+then ran, while a workbench job behind it showed the same line in the browser
+and, when cancelled, dropped itself without touching the run in front of it.
+The lock was free 0.00s after a mid-engine cancel.

@@ -180,7 +180,9 @@ async def _run(job: dict, src: Path, stem: str, kwargs: dict) -> None:
             output_path=str(S.HY3D_OUT / (stem + ".glb")),
             ctx=WebCtx(job), **kwargs)
     except asyncio.CancelledError:
+        # api_cancel has usually written a truer note already; keep it.
         job.update(state="cancelled", message="cancelled")
+        job.setdefault("note", "cancelled before it finished")
         raise
     except Exception as e:
         job.update(state="error", error=str(e)[-2000:], message="failed")
@@ -205,14 +207,36 @@ async def api_cancel(request):
     job = JOBS.get(request.path_params["job_id"])
     if job is None:
         return JSONResponse({"error": "unknown job"}, 404)
-    # cancel_job kills the engine child; cancelling the task alone would leave
-    # it holding the GPU and the machine-wide lock.
-    killed = await S.cancel_job()
+    # Cancelling the task is the whole cancel, and deliberately so:
+    # _run_engine kills its own child on CancelledError, so the kill lands on
+    # this job's engine and no other. The tool-level S.cancel_job() must NOT be
+    # used here -- it kills _current_proc, a process-wide global, so cancelling
+    # a job still queued behind another tab would kill the tab that is running.
+    #
+    # What the cancel actually accomplishes depends on where the task is, and
+    # the button has to say which: a job on the GPU dies, a job in the queue is
+    # merely dropped, and an engine belonging to another process (an MCP
+    # session holding the flock) is out of reach entirely. Reporting a flat
+    # "cancelled" for all three would be a lie in two of them.
+    msg = str(job.get("message", ""))
+    waiting = msg == "queued" or msg.startswith("waiting for the GPU")
     task = job.get("task")
-    if task is not None:
-        task.cancel()
-    job.update(state="cancelled", message="cancelled")
-    return JSONResponse({"cancelled": True, "engine": killed})
+    if task is None or task.done():
+        return JSONResponse({"cancelled": False, "note":
+                             "that job is already %s" % job.get("state")})
+    # Ours by elimination: _job_lock means only one job in this process is past
+    # the locks, and if we are not waiting, that job is this one.
+    engine = S._current_proc is not None and not waiting
+    task.cancel()
+    if engine:
+        note = "engine killed; the GPU frees once the job unwinds"
+    elif waiting:
+        note = ("dropped while it waited for the GPU -- no engine of this job "
+                "had started, and whatever is generating keeps going")
+    else:
+        note = "stopped between stages; no engine was running"
+    job.update(state="cancelled", message="cancelled", note=note)
+    return JSONResponse({"cancelled": True, "engine": engine, "note": note})
 
 
 async def api_stl(request):

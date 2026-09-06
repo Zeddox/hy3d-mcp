@@ -909,6 +909,12 @@ def _server_status() -> dict:
 async def cancel_job() -> dict:
     """Kill the generation currently running and free the queue.
 
+    Process-wide, not per-call: it kills whichever engine this process
+    started, whoever asked for it. That is right for an MCP server, where one
+    client owns the session, and wrong for anything juggling several jobs --
+    the workbench cancels by cancelling its own task instead, because
+    _run_engine already kills its child on CancelledError.
+
     For when a client has stopped waiting but the engine has not stopped
     working — a job abandoned that way holds the single-job queue and the
     GPU, and every later call blocks behind it. Safe to call when nothing

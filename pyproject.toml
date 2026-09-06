@@ -1,6 +1,6 @@
 [project]
 name = "hy3d-mcp"
-version = "0.8.0"
+version = "0.8.1"
 description = "MCP server and local workbench for Hunyuan3D-2 image-to-3D on CUDA: concept image in, game-ready GLB out"
 readme = "README.md"
 requires-python = ">=3.12"

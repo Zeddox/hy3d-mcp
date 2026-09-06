@@ -444,6 +444,8 @@ async function poll(id, t0) {
     loadGallery();
   } else if (j.state === "error") {
     $("notes").innerHTML = '<span class="err">' + j.error + "</span>";
+  } else if (j.state === "cancelled" && j.note) {
+    $("notes").textContent = j.note;
   }
 }
 $("go").addEventListener("click", async () => {
@@ -461,7 +463,12 @@ $("go").addEventListener("click", async () => {
   poll(r.job, Date.now());
 });
 $("cancel").addEventListener("click", async () => {
-  if (state.job) await fetch("/api/job/" + state.job + "/cancel", { method: "POST" });
+  if (!state.job) return;
+  // The server says which of "killed it", "dropped a queued job" and "there
+  // was nothing here to kill" happened; the last one matters, because the GPU
+  // is then still busy with someone else's run.
+  const r = await (await fetch("/api/job/" + state.job + "/cancel", { method: "POST" })).json();
+  if (r.note) $("notes").textContent = r.note;
 });
 
 /* ---------- stl ---------- */
