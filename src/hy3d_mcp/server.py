@@ -337,6 +337,11 @@ async def generate_model(
 
     dst = _out_path(src.stem, ".glb", output_path)
     stages: list[str] = []
+    # Bound before the lock: the result dict reads both outside the try, and an
+    # engine that writes the GLB but garbles its final line must not take the
+    # call down with a NameError on its way to reporting success.
+    stats: dict = {}
+    warning: str | None = None
     started = time.monotonic()
     with _queue_guard:
         _queue_depth += 1
@@ -354,9 +359,15 @@ async def generate_model(
                     # The local key refuses busy backgrounds rather than
                     # shredding them. That is not a dead end here: the engine
                     # venv carries rembg, which handles painted concept art
-                    # the corner-sample key cannot. Let the engine do it.
-                    stages.append("cutout skipped (%s); using rembg in-engine"
-                                  % str(e).split(": ", 1)[-1][:120])
+                    # the corner-sample key cannot. Let the engine do it --
+                    # but rembg only keys. cutout.py also crops to the alpha
+                    # bbox and pads square, so the subject fills the latent
+                    # instead of sharing it with empty background; the fallback
+                    # input is framed differently, not merely keyed differently.
+                    stages.append(
+                        "cutout skipped (%s); keyed by rembg in-engine, "
+                        "without the square recrop"
+                        % str(e).split(": ", 1)[-1][:200])
 
             cmd = [str(ENGINE_PY), str(ENGINE_CLI), str(gen_input),
                    "-o", str(dst), "--seed", str(seed),
@@ -379,6 +390,15 @@ async def generate_model(
                 raise RuntimeError("shape generation failed (exit %d):\n%s"
                                    % (rc, (se or so)[-2000:]))
             stats = _engine_json(so)
+            if not stats:
+                # The GLB is on disk and the engine exited clean, so this is a
+                # real result -- but every count below comes back null, and a
+                # null that looks like a measurement is worse than one that
+                # explains itself.
+                warning = ("the engine wrote the model but its result line "
+                           "was unreadable, so counts and memory figures are "
+                           "unavailable. The file itself is fine -- run "
+                           "render_preview or export_stl to inspect it.")
             stages.append("shape")
             if stats.get("raw_faces") and stats.get("faces") \
                     and stats["faces"] < stats["raw_faces"]:
@@ -399,8 +419,8 @@ async def generate_model(
            "seconds": round(seconds, 1), "stages": stages,
            "textured": False,
            "progress": "streamed" if streamed else "unavailable"}
-    if stats.get("warning"):
-        out["warning"] = stats["warning"]
+    if stats.get("warning") or warning:
+        out["warning"] = stats.get("warning") or warning
     return out
 
 
