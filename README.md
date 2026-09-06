@@ -179,11 +179,29 @@ holding the queue.
 ## The workbench
 
 A browser front end over the same tools, for when you would rather point at
-an image than describe one:
+an image than describe one. From a checkout, one command starts everything:
 
-    pip install "hy3d-mcp[web]"   # or: uv pip install ...
-    hy3d-web
+    ./hy3d
     # hy3d workbench  ->  http://localhost:8760
+
+`hy3d-web` is a console-script entry point, which means it exists only inside
+the server venv and only after the package has been installed there — a venv
+built before 0.8.0 has `hy3d-mcp` and no `hy3d-web` at all. `./hy3d` is the
+wrapper that makes that true before it runs one: it creates or repairs the
+server venv, runs the same checks `server_status` reports (refusing to start
+a page whose only working button would be the gallery), and hands over with
+`exec` so Ctrl-C stops the server rather than the wrapper.
+
+    ./hy3d                  start it on 127.0.0.1:8760
+    ./hy3d web --lan        bind 0.0.0.0 for a browser off this host
+    ./hy3d web --background  detach, logging to ~/.hy3d/web.log
+    ./hy3d stop             stop a backgrounded one
+    ./hy3d status           run the checks and exit
+    ./hy3d install          hand off to install.sh (engine venv, weights)
+
+Engine setup stays in `install.sh`, which `./hy3d` names but never runs
+uninvited — phase 5 downloads 4.6GB and asks first. From a wheel rather than
+a checkout, `pip install "hy3d-mcp[web]"` and `hy3d-web` are the equivalent.
 
 Drop or paste a concept image, watch the engine's own progress, orbit the
 result in three.js, and export an STL with the printability checks attached.

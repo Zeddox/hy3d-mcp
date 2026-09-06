@@ -27,6 +27,7 @@ import re
 import socket
 import time
 import uuid
+from importlib.metadata import version
 from pathlib import Path
 
 from starlette.applications import Starlette
@@ -277,6 +278,17 @@ async def api_status(request):
     return JSONResponse(await asyncio.to_thread(S.server_status))
 
 
+async def api_ping(request):
+    """Cheap identity check: is a workbench on this port, and which one.
+
+    Separate from /api/status because that one probes the engine venv and
+    imports torch to do it -- six seconds, which is fine for a status panel
+    and useless to a launcher deciding whether the port is already ours.
+    """
+    return JSONResponse({"hy3d": "workbench", "version": version("hy3d-mcp"),
+                         "jobs": len(JOBS)})
+
+
 async def files(request):
     """Serve a GLB, image or STL out of HY3D_OUT and nothing else."""
     want = (S.HY3D_OUT / request.path_params["path"]).resolve()
@@ -298,6 +310,7 @@ app = Starlette(routes=[
     Route("/api/stl", api_stl, methods=["POST"]),
     Route("/api/gallery", api_gallery),
     Route("/api/status", api_status),
+    Route("/api/ping", api_ping),
     Route("/files/{path:path}", files),
 ])
 

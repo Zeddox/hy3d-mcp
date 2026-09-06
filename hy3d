@@ -1,0 +1,240 @@
+#!/usr/bin/env bash
+#
+# One entry point for the local pipeline: repair the server venv, check the
+# engine, start the workbench.
+#
+#   ./hy3d                start the workbench on http://127.0.0.1:8760
+#   ./hy3d web --lan      bind 0.0.0.0 instead, for a browser off this host
+#   ./hy3d web --background   detach, logging to ~/.hy3d/web.log
+#   ./hy3d stop           stop a backgrounded workbench
+#   ./hy3d status         run the checks and exit
+#   ./hy3d install [...]  hand off to install.sh (engine venv, weights)
+#
+# hy3d-web itself is a console-script entry point, not a script in the repo:
+# it exists only inside the server venv, and only once the package has been
+# installed there. This wrapper is what makes that true before it runs one.
+#
+# Engine setup lives in install.sh and stays there — six idempotent phases and
+# a 4.6GB download that asks first. This never runs it uninvited; it names it.
+set -uo pipefail
+
+HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+# Every path here honours an exported value first: a user pointed at a second
+# checkout or a shared output directory must not be silently overridden by our
+# defaults, and server.py resolves the engine ones the same way.
+SERVER_VENV="${HY3D_SERVER_VENV:-$HOME/.hy3d/server-venv}"
+SERVER_VENV="${SERVER_VENV/#\~/$HOME}"
+OUT_DIR="${HY3D_OUT:-$HOME/hy3d-output}"
+OUT_DIR="${OUT_DIR/#\~/$HOME}"
+PY="$SERVER_VENV/bin/python"
+UV="${UV:-$(command -v uv || echo "$HOME/.local/bin/uv")}"
+PIDFILE="$HOME/.hy3d/web.pid"
+LOGFILE="$HOME/.hy3d/web.log"
+
+HOST=127.0.0.1
+PORT="${HY3D_WEB_PORT:-8760}"
+BACKGROUND=0
+
+RED=$'\033[31m'; GRN=$'\033[32m'; YEL=$'\033[33m'; DIM=$'\033[2m'; RST=$'\033[0m'
+[ -t 1 ] || { RED=""; GRN=""; YEL=""; DIM=""; RST=""; }
+
+say()  { printf '%s\n' "$*"; }
+ok()   { printf '  %sok%s      %s\n' "$GRN" "$RST" "$*"; }
+skip() { printf '  %sskip%s    %s\n' "$DIM" "$RST" "$*"; }
+work() { printf '  %srun%s     %s\n' "$YEL" "$RST" "$*"; }
+warn() { printf '  %swarn%s    %s\n' "$YEL" "$RST" "$*"; }
+bad()  { printf '  %sFAILED%s  %s\n' "$RED" "$RST" "$*"; }
+
+usage() { sed -n '3,17p' "$0" | sed 's/^# \{0,1\}//'; exit 0; }
+
+# ---------------------------------------------------------------- server venv
+# The repair case is not hypothetical: a venv built before 0.8.0 has hy3d-mcp
+# and no hy3d-web, because entry points are written at install time and 0.8.0
+# is when the second one appeared. Test for the script, not for the venv.
+ensure_venv() {
+    if [ -x "$PY" ] && [ -x "$SERVER_VENV/bin/hy3d-web" ]; then
+        skip "server venv ($("$PY" -V 2>&1))"
+        return 0
+    fi
+    [ -x "$UV" ] || { bad "uv not found — https://docs.astral.sh/uv/"; return 1; }
+    if [ ! -x "$PY" ]; then
+        work "creating the server venv at $SERVER_VENV"
+        mkdir -p "$(dirname "$SERVER_VENV")"
+        "$UV" venv --python 3.12 "$SERVER_VENV" >/dev/null 2>&1 \
+            || { bad "uv venv failed at $SERVER_VENV"; return 1; }
+    fi
+    work "installing hy3d-mcp[web] into the server venv"
+    # Editable, and from HERE: this is a checkout tool. The wheel does not
+    # ship it, and -e keeps `git pull` enough to update the running server.
+    "$UV" pip install --python "$PY" -e "${HERE}[web]" >/dev/null 2>&1 \
+        || { bad "install failed — retry by hand: $UV pip install --python $PY -e '${HERE}[web]'"; return 1; }
+    ok "server venv ready ($("$PY" -V 2>&1))"
+}
+
+# ----------------------------------------------------------------- preflight
+# Not a second copy of the checks: _server_status() is what the MCP tool and
+# the workbench's own status line report, and every failing check already
+# carries the fix that repairs it.
+preflight() {
+    local out rc
+    out="$("$PY" - <<'PY' 2>&1
+import sys
+from hy3d_mcp.server import _server_status
+# Hard checks gate generation; the soft two degrade a feature and no more.
+HARD = ("engine_repo_ok", "engine_venv_ok", "cuda_ok", "driver_ok",
+        "weights_cached", "venv_ok")
+s = _server_status()
+failed = 0
+for key, val in s.items():
+    if not isinstance(val, dict) or "ok" not in val:
+        continue
+    hard = key in HARD
+    if val["ok"]:
+        note = ""
+        if key == "cuda_ok" and "device" in val:
+            note = " — %s, %.2f/%.2f GiB free" % (
+                val["device"], val["free_gib"], val["total_gib"])
+        if val.get("warning"):
+            print("WARN\t%s\t%s" % (key, val["warning"]))
+        else:
+            print("OK\t%s\t%s" % (key, note))
+    else:
+        print("%s\t%s\t%s" % ("BAD" if hard else "WARN", key, val.get("fix", "")))
+        failed += hard
+print("CONFIG\t%s\t%s" % (s["config"]["HY3D_ENGINE_REPO"], s["config"]["HY3D_OUT"]))
+sys.exit(1 if failed else 0)
+PY
+)"
+    rc=$?
+    local line kind name detail
+    while IFS=$'\t' read -r kind name detail; do
+        case "$kind" in
+            OK)     ok "$name$detail" ;;
+            WARN)   warn "$name — $detail" ;;
+            BAD)    bad "$name — $detail" ;;
+            CONFIG) say "  ${DIM}engine: $name${RST}"; say "  ${DIM}output: $detail${RST}" ;;
+            *)      [ -n "$kind$name$detail" ] && say "  $kind$name$detail" ;;
+        esac
+    done <<< "$out"
+    if [ "$rc" != 0 ]; then
+        say ""
+        say "${RED}the engine is not ready${RST} — most of the fixes above are one command:"
+        say "  bash $HERE/install.sh          ${DIM}# inspects first, asks before downloading${RST}"
+    fi
+    return $rc
+}
+
+# ---------------------------------------------------------------------- port
+# Three cases that look identical from a bind error: our own workbench already
+# up, something else on the port, and nothing at all. Ask the server, do not
+# infer from a pidfile — a pidfile survives the process that wrote it.
+port_state() {
+    "$PY" - "$PORT" <<'PY'
+import json, socket, sys, urllib.request
+port = int(sys.argv[1])
+
+
+def listening():
+    sock = socket.socket()
+    sock.settimeout(1.0)
+    try:
+        sock.connect(("127.0.0.1", port))
+        return True
+    except OSError:
+        return False
+    finally:
+        sock.close()
+
+
+if not listening():
+    print("free")
+    sys.exit(0)
+try:
+    # /api/ping, not /api/status: status probes the engine venv and imports
+    # torch on the way, which is six seconds and would read as "not ours".
+    with urllib.request.urlopen("http://127.0.0.1:%d/api/ping" % port,
+                                timeout=5) as r:
+        print("ours" if json.load(r).get("hy3d") else "busy")
+except Exception:
+    print("busy")
+PY
+}
+
+# ----------------------------------------------------------------- subcommands
+cmd_web() {
+    say "${DIM}hy3d workbench${RST}"
+    ensure_venv || exit 1
+    # Before the checks, not after: preflight imports torch to prove CUDA,
+    # which is six seconds nobody should spend to be told the server they
+    # wanted is already up.
+    case "$(port_state)" in
+        ours) say "  ${YEL}already running${RST} on port $PORT — open http://localhost:$PORT"
+              say "  ${DIM}stop it with ./hy3d stop, or Ctrl-C in its terminal${RST}"
+              exit 0 ;;
+        busy) bad "port $PORT is taken by something that is not a workbench — \
+re-run with --port N"
+              exit 1 ;;
+    esac
+    preflight || exit 1
+    mkdir -p "$OUT_DIR"
+
+    if [ "$BACKGROUND" = 1 ]; then
+        mkdir -p "$(dirname "$PIDFILE")"
+        nohup "$SERVER_VENV/bin/hy3d-web" --host "$HOST" --port "$PORT" \
+            >> "$LOGFILE" 2>&1 &
+        echo $! > "$PIDFILE"
+        sleep 2
+        say ""
+        tail -3 "$LOGFILE"
+        say "  ${DIM}pid $(cat "$PIDFILE"), log $LOGFILE — stop with ./hy3d stop${RST}"
+        exit 0
+    fi
+    say ""
+    # exec, so Ctrl-C reaches the server rather than this wrapper, and no
+    # bash process outlives it holding the terminal.
+    exec "$SERVER_VENV/bin/hy3d-web" --host "$HOST" --port "$PORT"
+}
+
+cmd_stop() {
+    [ -f "$PIDFILE" ] || { say "no pidfile at $PIDFILE — nothing backgrounded by ./hy3d"; exit 0; }
+    local pid; pid="$(cat "$PIDFILE")"
+    # Verify before killing: a pidfile outlives its process, and the number in
+    # it may since have been reused by something else entirely.
+    if [ -r "/proc/$pid/cmdline" ] && tr '\0' ' ' < "/proc/$pid/cmdline" | grep -q "hy3d"; then
+        kill "$pid" && ok "stopped pid $pid"
+        rm -f "$PIDFILE"
+    else
+        warn "pid $pid is not a workbench (already stopped?) — removing the stale pidfile"
+        rm -f "$PIDFILE"
+    fi
+}
+
+CMD="${1:-web}"
+[ $# -gt 0 ] && shift
+case "$CMD" in
+    -h|--help|help) usage ;;
+    install) exec bash "$HERE/install.sh" "$@" ;;
+esac
+while [ $# -gt 0 ]; do
+    case "$1" in
+        --lan)  HOST=0.0.0.0 ;;
+        --host) HOST="${2:-}"; shift ;;
+        --port) PORT="${2:-}"; shift ;;
+        --background|-b) BACKGROUND=1 ;;
+        -h|--help) usage ;;
+        *) say "unknown argument: $1 (try --help)"; exit 2 ;;
+    esac
+    shift
+done
+case "$CMD" in
+    web)    cmd_web ;;
+    status) ensure_venv || exit 1
+            preflight; rc=$?
+            case "$(port_state)" in
+                ours) ok "workbench up on http://localhost:$PORT" ;;
+                *)    skip "no workbench on port $PORT — start one with ./hy3d" ;;
+            esac
+            exit $rc ;;
+    stop)   cmd_stop ;;
+    *) say "unknown command: $CMD (try --help)"; exit 2 ;;
+esac
