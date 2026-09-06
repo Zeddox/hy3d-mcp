@@ -337,13 +337,20 @@ image, so a subject occupying a third of the frame was being reconstructed
 at a third of the available resolution. Measured end to end on the raw
 garden scene, no manual prep:
 
-    cutout (rembg+largest-component, 16.8% opaque, 1 stray island(s) dropped)
+    cutout (rembg+largest-component, 24.7% opaque, 1 stray island(s) dropped)
     shape
     decimate (542320 -> 40000)
     160.0s, 40,000 faces, watertight, 6.22 GiB peak reserved
 
 The mesh that comes back is the lantern alone, correctly proportioned, with
 no rock beside it.
+
+That 24.7% is measured on the square the worker writes, not on the source —
+the same key read 16.8% before the crop. Post-crop is the number worth
+reporting because it describes the image the generator actually sees; the
+pre-crop figure describes the composition of the concept art, and a
+perfectly keyed subject standing in the corner of a wide scene reads
+alarmingly low for a reason the crop has already fixed.
 
 Two consequences. `~/.u2net/u2net.onnx` (176MB) is now load-bearing rather
 than incidental — it downloads silently on first use, so the installer

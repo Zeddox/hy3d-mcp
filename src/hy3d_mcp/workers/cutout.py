@@ -167,8 +167,6 @@ def main() -> None:
 
     dropped = 0
     if alpha is None and args.method in ("auto", "rembg"):
-        if args.method == "corner":
-            pass
         try:
             alpha, rgb = key_rembg(args.input)
         except RuntimeError as e:
@@ -185,15 +183,24 @@ def main() -> None:
                        "method=auto to fall back to rembg" % refusal})
         sys.exit(2)
 
-    opaque_pct = 100.0 * float((alpha > 0.5).mean())
-    if opaque_pct < OPAQUE_MIN_PCT:
+    # Full-frame, and only to catch an empty key: frame_square would raise on
+    # a bbox of nothing.
+    raw_pct = 100.0 * float((alpha > 0.5).mean())
+    if raw_pct < OPAQUE_MIN_PCT:
         emit({"error": "%s key found almost nothing opaque (%.2f%%) — nothing "
-                       "usable to generate from" % (method, opaque_pct)})
+                       "usable to generate from" % (method, raw_pct)})
         sys.exit(2)
 
     dst = Path(args.output)
     dst.parent.mkdir(parents=True, exist_ok=True)
-    frame_square(rgb, alpha).save(dst)
+    sq = frame_square(rgb, alpha)
+    sq.save(dst)
+
+    # Reported after the recrop, because that is the image the generator sees.
+    # Pre-crop the number measures composition rather than the key: a subject
+    # keyed perfectly but occupying a corner of a wide scene reads as 5%, and
+    # the crop has already fixed exactly that.
+    opaque_pct = 100.0 * float((np.asarray(sq)[..., 3] > 127).mean())
 
     payload = {"png_path": str(dst), "opaque_pct": round(opaque_pct, 1),
                "method": method}

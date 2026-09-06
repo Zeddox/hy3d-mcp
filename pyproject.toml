@@ -1,6 +1,6 @@
 [project]
 name = "hy3d-mcp"
-version = "0.7.0"
+version = "0.7.1"
 description = "MCP server wrapping the local Hunyuan3D-MLX image-to-3D pipeline: concept image in, textured GLB out"
 readme = "README.md"
 requires-python = ">=3.12"

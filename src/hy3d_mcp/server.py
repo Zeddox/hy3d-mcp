@@ -550,13 +550,18 @@ def prepare_concept(image_path: str, output_path: str | None = None,
     started = time.monotonic()
     out = _run_worker("cutout.py", [str(src), str(dst), "--method", method])
     _record_job("prepare_concept", src.name, True, time.monotonic() - started)
+    # opaque_pct is measured on the square the worker writes, after the crop.
+    # Both thresholds are calibrated to that frame: a tall thin subject
+    # measures ~25% there once the square padding is counted, and a chunky one
+    # comfortably passes 60%, so only the extremes carry information.
     pct = out["opaque_pct"]
     if pct < 8.0:
-        out["warning"] = ("only %.1f%% opaque — the key may have eaten the "
-                          "subject; check the PNG" % pct)
-    elif pct > 60.0:
-        out["warning"] = ("%.1f%% opaque — background may not be plain; "
-                          "check the PNG for kept background" % pct)
+        out["warning"] = ("only %.1f%% opaque even after the crop — the key "
+                          "may have eaten the subject; check the PNG" % pct)
+    elif pct > 85.0:
+        out["warning"] = ("%.1f%% opaque — almost nothing was keyed out, which "
+                          "usually means background was kept; check the PNG"
+                          % pct)
     return out
 
 
@@ -878,7 +883,8 @@ def server_status() -> dict:
 
 
 @mcp.tool
-def setup_engine(confirm: bool = False, only: int | None = None) -> dict:
+async def setup_engine(confirm: bool = False,
+                       only: int | None = None) -> dict:
     """Install or repair the engine. Dry-run first; nothing runs uninvited.
 
     Called with no arguments it runs the installer in plan mode and returns
@@ -914,9 +920,29 @@ def setup_engine(confirm: bool = False, only: int | None = None) -> dict:
     argv = [str(INSTALLER), "--yes" if confirm else "--plan"]
     if only is not None:
         argv += ["--only", str(only)]
+
+    def run():
+        # to_thread, not a bare call: a real install runs for minutes, and the
+        # event loop has progress relays to service in the meantime.
+        return subprocess.run(["bash"] + argv, capture_output=True, text=True,
+                              timeout=SETUP_TIMEOUT, cwd=str(INSTALLER.parent))
+
     started = time.monotonic()
-    proc = subprocess.run(["bash"] + argv, capture_output=True, text=True,
-                          timeout=SETUP_TIMEOUT, cwd=str(INSTALLER.parent))
+    if confirm:
+        # A real install rewrites the venv a running generation is executing
+        # from -- uv would swap torch out from under a live subprocess. Refuse
+        # rather than queue behind it: the caller asked to install now, and an
+        # hour-long silent wait is not what they asked for. A dry run touches
+        # nothing and needs no lock.
+        if _job_lock.locked():
+            raise RuntimeError(
+                "a generation is running -- the installer would modify the "
+                "engine venv underneath it. Wait for it to finish, then "
+                "call again.")
+        async with _job_lock:
+            proc = await asyncio.to_thread(run)
+    else:
+        proc = await asyncio.to_thread(run)
     seconds = round(time.monotonic() - started, 1)
     _record_job("setup_engine", "phase %s" % (only or "all"),
                 proc.returncode == 0, seconds)

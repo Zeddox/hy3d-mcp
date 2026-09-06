@@ -86,22 +86,31 @@ to miss against a gray background. Check for it explicitly, along with a
 background gradient or a hard key light. Regenerating a concept costs
 seconds; a bad generation costs ~3 minutes and still has to be redone.
 
-**Better than looking: measure the key.** Run `prepare_concept` and check
-the alpha channel of the RGBA it writes. A clean key is almost entirely
-alpha 0 or 255 with well under 1% in between. What the histogram catches is
-**background non-uniformity**, which is easy to miss by eye: one observed
-gradient-gray background keyed at 36% partial alpha and left patches of
-background fully **opaque** — the key had smeared rather than separated. A
-flat white background of the same subject keyed at 0.1% partial.
+**Better than looking: measure the key — but read `method` first.** Run
+`prepare_concept`; what it reports depends on which key ran, and the two
+regimes do not share a diagnostic.
 
-When `prepare_concept` reports `method: rembg+largest-component` instead of
-`corner`, the corner key declined the image and a segmentation model keyed
-it instead. That is a signal about the image, not a blocker — but read it
-as one. It means the background was not plain, so check the result: the
-`note` field carries the corner key's reason, and `components_dropped`
-counts the extra subjects the segmenter found and threw away. On a garden
-scene that drop is exactly right (a loose rock became its own island); on a
-two-part subject it is the second part going missing.
+`method: corner` — check the alpha channel of the RGBA it writes. A clean
+corner key is almost entirely alpha 0 or 255 with well under 1% in between.
+What that histogram catches is **background non-uniformity**, easy to miss
+by eye: one observed gradient-gray background keyed at 36% partial alpha
+and left patches of background fully **opaque** — the key had smeared
+rather than separated. A flat white background of the same subject keyed at
+0.1% partial. High partial alpha here means regenerate the concept on a
+flat background.
+
+`method: rembg+largest-component` — the corner key declined and a
+segmentation model keyed the image instead. **Do not run the histogram test
+on this path.** u2net emits a confidence map, not a mask: a measured clean
+keying of a garden lantern was 75.3% alpha 0, 23.7% in the 200–254 band,
+and only 0.34% at a full 255. By the corner-key rule that is a 24% partial
+alpha catastrophe; it is in fact a correct cutout, and regenerating the
+concept would not move the number. The checks that mean something here are
+`components_dropped` — the extra subjects the segmenter found and threw
+away — and the PNG itself. On a garden scene that drop is exactly right (a
+loose rock became its own island); on a two-part subject it is the second
+part going missing. The `note` field carries the corner key's reason for
+declining, which tells you what about the image was not plain.
 
 Either way the image is cropped to the subject and padded square before it
 reaches the generator, so a subject that filled a third of the frame is not
