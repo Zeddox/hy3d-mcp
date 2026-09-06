@@ -1,53 +1,84 @@
 #!/usr/bin/env bash
 #
-# Guided setup for the Hunyuan3D-MLX engine that hy3d-mcp shells out to.
+# Guided setup for the Hunyuan3D-2 engine that hy3d-mcp shells out to,
+# on WSL2 or Linux with an NVIDIA card.
+#
+# Shape-only by design: an 8GB card cannot run the texture stage, so this
+# skips custom_rasterizer and DifferentiableRenderer entirely — the two
+# components whose compilation breaks most Windows/WSL installs.
 #
 # Every phase is idempotent: it inspects the target and skips work that is
 # already done, so re-running after a failure resumes rather than restarts.
-# The two expensive phases (swift build, 12GB weight download) ask before
-# they spend, unless --yes is passed.
+# The expensive phase (a ~4.6GB weight download) asks before it spends,
+# unless --yes is passed.
 #
 #   ./install.sh              inspect, then run, confirming expensive steps
 #   ./install.sh --plan       print what would happen and exit
 #   ./install.sh --yes        run unattended (for CI or the setup_engine tool)
 #   ./install.sh --only 3     run a single phase
 #
+# Phase numbers are a public contract — setup_engine(only=N) passes them
+# straight through — so they do not get renumbered.
+#
+#   1 preflight   2 checkout   3 venv+torch   4 deps   5 weights   6 verify
+#
 set -uo pipefail
 
-HY3D_REPO="${HY3D_REPO:-$HOME/git/repos/hunyuan3d-mlx}"
-HY3D_REPO="${HY3D_REPO/#\~/$HOME}"
-WORKER_VENV="${HY3D_WORKER_VENV:-$HOME/.hy3d/worker-venv}"
-ENGINE_GIT="https://github.com/ZimengXiong/Hunyuan3D-MLX.git"
+ENGINE_REPO="${HY3D_ENGINE_REPO:-$HOME/git/repos/Hunyuan3D-2}"
+ENGINE_REPO="${ENGINE_REPO/#\~/$HOME}"
+ENGINE_VENV="${HY3D_ENGINE_VENV:-$HOME/.hy3d/engine-venv}"
+ENGINE_VENV="${ENGINE_VENV/#\~/$HOME}"
+ENGINE_GIT="https://github.com/Tencent-Hunyuan/Hunyuan3D-2.git"
+# Pinned: upstream moves, and the callback signature the progress protocol
+# depends on is not part of any published API.
+ENGINE_REF="${HY3D_ENGINE_REF:-f8db63096c8282cb27354314d896feba5ba6ff8a}"
 
-# .build/release is a symlink into this; the metallib has to land in the real
-# directory too or the binary starts and then fails to find its Metal kernels.
-BUILD_REAL_REL=".build/arm64-apple-macosx/release"
+# Shape weights only. The same repo carries the paint stage, which is
+# multiples of this and useless on 8GB, so the download is filtered to the
+# one subfolder rather than snapshotting the repo.
+SHAPE_HF="tencent/Hunyuan3D-2"
+SHAPE_SUB="hunyuan3d-dit-v2-0"
+# Upstream resolves weights from $HY3DGEN_MODELS (default ~/.cache/hy3dgen)
+# before it ever asks HuggingFace — see hy3dgen/shapegen/utils.py — so
+# fetching into that tree is what makes the first run offline-clean.
+MODELS_DIR="${HY3DGEN_MODELS:-$HOME/.cache/hy3dgen}"
+MODELS_DIR="${MODELS_DIR/#\~/$HOME}"
 
-WORKER_PKGS=(opencv-python numpy trimesh pillow scipy pyrender pygltflib)
+# numpy<2: pymeshlab wheels of this era are built against the numpy 1.x ABI
+# and fail at *import*, not at use.
+# scikit-image: required by shapegen/models/autoencoders/surface_extractors.py
+# for the default mc_algo='mc' path, but COMMENTED OUT in upstream's
+# requirements.txt. Omitting it is the first thing that breaks a shape run.
+# rembg+onnxruntime: the cutout worker's fallback key for real concept art.
+# Deliberately absent: xatlas + diso (texture UV / mc_algo='dmc'),
+# gradio/fastapi/uvicorn (demo app), custom_rasterizer, DifferentiableRenderer.
+ENGINE_PKGS=(
+    "numpy<2"
+    transformers diffusers accelerate safetensors
+    einops omegaconf pyyaml tqdm
+    opencv-python pillow scipy
+    trimesh pygltflib scikit-image
+    pymeshlab
+    rembg onnxruntime
+    huggingface_hub
+    pyrender
+)
 
 # Every pyrender release pins pyopengl==3.1.0, which uv treats as hard, so this
-# cannot join WORKER_PKGS — resolving the two together is reported unsatisfiable.
-# 3.1.0 predates numpy 2 and its glGenTextures wrapper raises "No array-type
-# handler for type _ctypes.type", which only bites on TEXTURED meshes; an
-# untextured render succeeds and hides it. Every painted GLB hits it. pyrender
-# itself works fine against newer pyopengl, so the pin gets overridden after the
-# fact.
-WORKER_GL_MIN="PyOpenGL>=3.1.7"
+# cannot join ENGINE_PKGS — resolving the two together is reported
+# unsatisfiable. 3.1.0 predates numpy 2 and its glGenTextures wrapper raises
+# "No array-type handler for type _ctypes.type", which only bites on TEXTURED
+# meshes; an untextured render succeeds and hides it. pyrender itself works
+# fine against newer pyopengl, so the pin gets overridden after the fact.
+GL_MIN="PyOpenGL>=3.1.7"
 
-WORKER_IMPORT="import cv2, numpy, trimesh, PIL, scipy, pyrender, pygltflib"
+CORE_IMPORT="import torch, numpy, cv2, PIL, scipy, trimesh, pygltflib, skimage, pymeshlab, rembg"
 
-# Split from the imports above because the consequences differ: without these
-# packages nothing runs, whereas a stale pyopengl costs only render_preview.
-# Importing pyrender proves nothing on its own — the failure is inside a GL
-# call, so the stale pin passes a plain import and still cannot render. Tested
-# against the same floor the installer applies, so detection and repair cannot
-# drift apart.
-WORKER_GL_CHECK="import OpenGL
-_v = tuple(int(''.join(c for c in p if c.isdigit()) or 0)
-           for p in OpenGL.__version__.split('.')[:3])
-assert _v >= (3, 1, 7), 'pyopengl %s cannot render textured meshes' % OpenGL.__version__"
-SHAPE_HF="zimengxiong/hunyuan3d-mlx-shape-small"
-PAINT_HF="zimengxiong/hunyuan3d-mlx-paint-large"
+# System libraries. pymeshlab dlopens libOpenGL.so.0 even headless, and
+# failing to find it takes its io_base plugin down with it — decimation then
+# surfaces as the thoroughly misleading "Unknown format for load: ply".
+# libegl1 is what gives pyrender a context with no display.
+APT_LIBS=(libopengl0 libegl1)
 
 MODE=run          # run | plan
 ASSUME_YES=0
@@ -65,10 +96,10 @@ work() { printf '  %srun%s     %s\n' "$YEL" "$RST" "$*"; }
 # Degraded but usable — unlike bad(), leaves FAILED alone so the phase passes.
 warn() { printf '  %swarn%s    %s\n' "$YEL" "$RST" "$*"; }
 bad()  { printf '  %sFAILED%s  %s\n' "$RED" "$RST" "$*"; FAILED=1; }
-phase(){ printf '\n%s[%s/7] %s%s\n' "$DIM" "$1" "$2" "$RST"; }
+phase(){ printf '\n%s[%s/6] %s%s\n' "$DIM" "$1" "$2" "$RST"; }
 
 usage() {
-    sed -n '3,16p' "$0" | sed 's/^# \{0,1\}//'
+    sed -n '3,22p' "$0" | sed 's/^# \{0,1\}//'
     exit 0
 }
 
@@ -77,13 +108,25 @@ while [ $# -gt 0 ]; do
         --plan)   MODE=plan ;;
         --yes|-y) ASSUME_YES=1 ;;
         --only)   ONLY="${2:-}"; shift ;;
-        --repo)   HY3D_REPO="${2:-}"; shift ;;
-        --worker-venv) WORKER_VENV="${2:-}"; shift ;;
+        --repo)   ENGINE_REPO="${2:-}"; shift ;;
+        --venv)   ENGINE_VENV="${2:-}"; shift ;;
         -h|--help) usage ;;
         *) say "unknown argument: $1 (try --help)"; exit 2 ;;
     esac
     shift
 done
+
+PY="$ENGINE_VENV/bin/python"
+UV="${UV:-$(command -v uv || echo "$HOME/.local/bin/uv")}"
+
+# A phase number nobody runs must not report success: --only is a public
+# contract through setup_engine(only=N), and silently doing nothing there
+# looks exactly like a clean install.
+case "$ONLY" in
+    ""|1|2|3|4|5|6) ;;
+    *) say "unknown phase: $ONLY (valid: 1 preflight, 2 checkout, 3 venv+torch, 4 deps, 5 weights, 6 verify)"
+       exit 2 ;;
+esac
 
 wanted() { [ -z "$ONLY" ] || [ "$ONLY" = "$1" ]; }
 
@@ -103,307 +146,271 @@ confirm() {
 # ---------------------------------------------------------------- phase 1
 preflight() {
     phase 1 "preflight"
-    local arch os
-    arch="$(uname -m)"
-    if [ "$arch" != "arm64" ]; then
-        bad "this pipeline is Apple Silicon only (found $arch)"
+
+    if grep -qi microsoft /proc/version 2>/dev/null; then
+        ok "WSL2"
     else
-        ok "Apple Silicon"
+        ok "$(uname -s) $(uname -m)"
     fi
 
-    os="$(sw_vers -productVersion 2>/dev/null || echo unknown)"
-    ok "macOS $os"
-
-    if command -v swift >/dev/null 2>&1; then
-        ok "swift $(swift --version 2>/dev/null | head -1 | sed 's/.*version \([0-9.]*\).*/\1/')"
-    else
-        bad "swift not found — install Xcode or the Command Line Tools: xcode-select --install"
-    fi
-
-    for tool in git uv python3; do
-        if command -v "$tool" >/dev/null 2>&1; then
-            ok "$tool"
+    if command -v nvidia-smi >/dev/null 2>&1; then
+        local line name total
+        line="$(nvidia-smi --query-gpu=name,memory.total,driver_version \
+                --format=csv,noheader 2>/dev/null | head -1)"
+        if [ -z "$line" ]; then
+            bad "nvidia-smi is present but reports no GPU. Inside WSL the
+        Windows driver is projected in — never install an NVIDIA driver in
+        the WSL guest. Check that /usr/lib/wsl/lib is on the loader path."
         else
-            case "$tool" in
-                uv) bad "uv not found — https://docs.astral.sh/uv/ (curl -LsSf https://astral.sh/uv/install.sh | sh)" ;;
-                *)  bad "$tool not found" ;;
-            esac
+            name="${line%%,*}"
+            total="$(printf '%s' "$line" | cut -d, -f2 | tr -dc '0-9')"
+            ok "$line"
+            if [ -n "$total" ] && [ "$total" -lt 8000 ]; then
+                warn "${total}MiB of VRAM — this pipeline is tuned for 8GB and \
+peaks near 6.2GiB at defaults. Expect to need cpu_offload, or a lower octree."
+            fi
         fi
-    done
+    else
+        bad "nvidia-smi not found — no GPU is visible. On WSL this means the
+        Windows-side NVIDIA driver is missing or /usr/lib/wsl/lib is not on
+        the loader path. Do NOT install a driver inside the WSL guest."
+    fi
 
-    # weights 12G + build 1.3G + metallib, with headroom for the HF cache.
+    local tool
+    for tool in git python3; do
+        if command -v "$tool" >/dev/null 2>&1; then ok "$tool"; else bad "$tool not found"; fi
+    done
+    if [ -x "$UV" ]; then
+        ok "uv ($UV)"
+    else
+        bad "uv not found — https://docs.astral.sh/uv/ (curl -LsSf https://astral.sh/uv/install.sh | sh)"
+    fi
+
+    # weights 4.6G + venv ~7G (the cu124 torch wheels are most of it) + repo,
+    # with headroom.
     local free
-    free="$(df -g "$HOME" 2>/dev/null | awk 'NR==2 {print $4}')"
-    if [ -n "$free" ] && [ "$free" -lt 20 ]; then
-        bad "only ${free}GB free on $HOME — the engine needs ~15GB (12GB weights, 1.3GB build)"
+    free="$(df -BG --output=avail "$HOME" 2>/dev/null | tail -1 | tr -dc '0-9')"
+    if [ -n "$free" ] && [ "$free" -lt 15 ]; then
+        bad "only ${free}GB free on $HOME — this needs ~13GB (4.6GB weights, ~7GB venv)"
     elif [ -n "$free" ]; then
         ok "${free}GB free"
     fi
 
-    local mem
-    mem="$(( $(sysctl -n hw.memsize 2>/dev/null || echo 0) / 1073741824 ))"
-    if [ "$mem" -gt 0 ] && [ "$mem" -lt 32 ]; then
-        say "  ${YEL}warn${RST}    ${mem}GB unified memory — texture paint peaks 25-33GB and will swap"
-    elif [ "$mem" -gt 0 ]; then
-        ok "${mem}GB unified memory"
+    # Reported, not installed: these need root, and the rest of the install
+    # does not. Phase 6 proves whether they are actually working.
+    local missing=()
+    for lib in "${APT_LIBS[@]}"; do
+        dpkg -s "$lib" 2>/dev/null | grep -q '^Status: install ok' || missing+=("$lib")
+    done
+    if [ ${#missing[@]} -eq 0 ]; then
+        ok "system GL libraries (${APT_LIBS[*]})"
+    else
+        warn "missing system libraries: ${missing[*]} — install them with:
+             sudo apt install ${missing[*]}
+          libopengl0 gates pymeshlab, and therefore decimation; libegl1 gates
+          headless preview rendering. Generation itself works without both."
     fi
 }
 
 # ---------------------------------------------------------------- phase 2
 clone_engine() {
-    phase 2 "engine checkout — $HY3D_REPO"
-    if [ -d "$HY3D_REPO/.git" ]; then
-        skip "already cloned ($(git -C "$HY3D_REPO" rev-parse --short HEAD 2>/dev/null))"
+    phase 2 "engine checkout — $ENGINE_REPO"
+    if [ -d "$ENGINE_REPO/.git" ]; then
+        skip "already cloned ($(git -C "$ENGINE_REPO" rev-parse --short HEAD 2>/dev/null))"
         return 0
     fi
-    if [ -e "$HY3D_REPO" ]; then
-        bad "$HY3D_REPO exists but is not a git checkout — move it aside first"
+    if [ -e "$ENGINE_REPO" ]; then
+        bad "$ENGINE_REPO exists but is not a git checkout — move it aside first"
         return 1
     fi
-    [ "$MODE" = plan ] && { work "git clone $ENGINE_GIT (~200MB)"; return 0; }
+    [ "$MODE" = plan ] && { work "git clone $ENGINE_GIT at ${ENGINE_REF:0:8} (~200MB)"; return 0; }
     work "cloning $ENGINE_GIT"
-    mkdir -p "$(dirname "$HY3D_REPO")"
-    git clone --depth 1 "$ENGINE_GIT" "$HY3D_REPO" || { bad "clone failed"; return 1; }
-    ok "cloned"
+    mkdir -p "$(dirname "$ENGINE_REPO")"
+    git clone "$ENGINE_GIT" "$ENGINE_REPO" || { bad "clone failed"; return 1; }
+    git -C "$ENGINE_REPO" checkout --quiet "$ENGINE_REF" \
+        || { bad "checkout of $ENGINE_REF failed"; return 1; }
+    ok "cloned at ${ENGINE_REF:0:8}"
 }
 
 # ---------------------------------------------------------------- phase 3
-build_binary() {
-    phase 3 "build the hy3d binary"
-    local bin="$HY3D_REPO/.build/release/hy3d"
-    if [ -x "$bin" ]; then
-        skip "already built ($(cd "$HY3D_REPO" && du -h .build 2>/dev/null | tail -1 | cut -f1))"
+build_venv() {
+    phase 3 "engine venv — $ENGINE_VENV (python 3.10, torch cu124)"
+    if [ -x "$PY" ]; then
+        skip "venv present, $("$PY" -V 2>&1)"
+    else
+        [ "$MODE" = plan ] && { work "uv venv --python 3.10 $ENGINE_VENV"; return 0; }
+        work "creating venv"
+        mkdir -p "$(dirname "$ENGINE_VENV")"
+        "$UV" venv --python 3.10 "$ENGINE_VENV" || { bad "uv venv failed"; return 1; }
+    fi
+
+    if "$PY" -c 'import torch,sys; sys.exit(0 if torch.__version__.startswith("2.5.1+cu124") else 1)' 2>/dev/null; then
+        skip "torch $("$PY" -c 'import torch;print(torch.__version__)')"
         return 0
     fi
-    [ -d "$HY3D_REPO" ] || { bad "no checkout at $HY3D_REPO — run phase 2 first"; return 1; }
-    [ "$MODE" = plan ] && { work "swift build -c release (~4 min, ~1.3GB)"; return 0; }
-    confirm "swift build -c release — takes about 4 minutes and writes ~1.3GB" || return 0
-    work "building (this is the slow one)"
-    ( cd "$HY3D_REPO" && swift build -c release ) || { bad "swift build failed"; return 1; }
-    [ -x "$bin" ] && ok "built $bin" || bad "build reported success but $bin is missing"
+    [ "$MODE" = plan ] && { work "install torch 2.5.1+cu124 and torchvision 0.20.1+cu124 (~3GB)"; return 0; }
+    work "installing torch 2.5.1+cu124 / torchvision 0.20.1+cu124"
+    # Both from the cu124 index in ONE command. Installing torchvision from
+    # PyPI afterwards silently pulls a different torch and discards the cu124
+    # build — which then imports perfectly and runs on the CPU.
+    "$UV" pip install --python "$PY" \
+        --index-url https://download.pytorch.org/whl/cu124 \
+        torch==2.5.1+cu124 torchvision==0.20.1+cu124 \
+        || { bad "torch install failed"; return 1; }
+    ok "torch $("$PY" -c 'import torch;print(torch.__version__)' 2>/dev/null)"
 }
 
 # ---------------------------------------------------------------- phase 4
-install_metallib() {
-    phase 4 "metallib"
-    local dest_a="$HY3D_REPO/metallib"
-    local dest_b="$HY3D_REPO/$BUILD_REAL_REL"
-    if [ -f "$dest_a/default.metallib" ] && [ -f "$dest_b/default.metallib" ]; then
-        skip "present in both metallib/ and $BUILD_REAL_REL"
+engine_deps() {
+    phase 4 "shape-only python deps"
+    [ -x "$PY" ] || { bad "no venv at $ENGINE_VENV — run phase 3 first"; return 1; }
+
+    if "$PY" -c "$CORE_IMPORT" 2>/dev/null && "$PY" -c "import pyrender" 2>/dev/null; then
+        skip "every engine package imports"
+    else
+        [ "$MODE" = plan ] && { work "install ${ENGINE_PKGS[*]} (~2GB)"; return 0; }
+        work "installing ${#ENGINE_PKGS[@]} packages"
+        # uv, not `python -m pip`: uv-created venvs ship without pip at all.
+        "$UV" pip install --python "$PY" "${ENGINE_PKGS[@]}" \
+            || { bad "package install failed — retry with: $UV pip install --python $PY ${ENGINE_PKGS[*]}"; return 1; }
+    fi
+
+    # Separate pass on purpose: resolving this alongside pyrender fails, so it
+    # has to land after pyrender has pulled in the 3.1.0 it asks for.
+    if "$PY" -c "import OpenGL, sys
+v = tuple(int(''.join(c for c in p if c.isdigit()) or 0) for p in OpenGL.__version__.split('.')[:3])
+sys.exit(0 if v >= (3, 1, 7) else 1)" 2>/dev/null; then
+        skip "pyopengl $("$PY" -c 'import OpenGL;print(OpenGL.__version__)') clears the render floor"
         return 0
     fi
-
-    local ver
-    ver="$(python3 - "$HY3D_REPO/Package.resolved" <<'PY' 2>/dev/null
-import json, sys
-try:
-    d = json.load(open(sys.argv[1]))
-except Exception:
-    sys.exit(1)
-pins = d.get("pins") or d.get("object", {}).get("pins", [])
-for p in pins:
-    name = p.get("identity") or p.get("package", "")
-    if "mlx-swift" in name.lower():
-        st = p.get("state", {})
-        print(st.get("version") or st.get("revision", ""))
-        break
-PY
-)"
-    if [ -z "$ver" ]; then
-        bad "could not read the mlx-swift version from $HY3D_REPO/Package.resolved"
-        return 1
-    fi
-    ok "mlx-swift pinned at $ver"
-
-    # mlx-swift and the pip mlx package are separate version series — there is
-    # no pip mlx 0.31.4 to match mlx-swift 0.31.4. Matching on major.minor and
-    # taking the newest patch is what reproduces a working metallib (verified:
-    # mlx-swift 0.31.4 -> pip mlx 0.31.2, byte-identical metallib).
-    local pip_ver
-    pip_ver="$(python3 - "$ver" <<'PY' 2>/dev/null
-import json, sys, urllib.request
-series = ".".join(sys.argv[1].split(".")[:2])
-try:
-    with urllib.request.urlopen("https://pypi.org/pypi/mlx/json", timeout=30) as r:
-        releases = json.load(r)["releases"]
-except Exception:
-    sys.exit(1)
-cand = [v for v in releases if v.startswith(series + ".") and releases[v]]
-if not cand:
-    sys.exit(2)
-print(max(cand, key=lambda v: tuple(int(x) for x in v.split(".") if x.isdigit())))
-PY
-)"
-    if [ -z "$pip_ver" ]; then
-        bad "no pip mlx release in the ${ver%.*}.x series (checked PyPI) — the
-        metallib must come from an mlx wheel matching mlx-swift $ver"
-        return 1
-    fi
-    ok "matching pip mlx release: $pip_ver"
-
-    [ "$MODE" = plan ] && { work "harvest mlx.metallib from pip mlx==$pip_ver (~158MB, copied to 2 locations)"; return 0; }
-
-    # swift build never emits the MLX metallib (mlx-swift SwiftPM limitation),
-    # so it has to come out of the pip wheel of the matching version.
-    local tmp
-    tmp="$(mktemp -d)"
-    trap 'rm -rf "$tmp"' RETURN
-    work "installing pip mlx==$pip_ver into a scratch venv to harvest its metallib"
-    uv venv "$tmp/venv" >/dev/null 2>&1 || { bad "uv venv failed"; return 1; }
-    uv pip install --python "$tmp/venv/bin/python" "mlx==$pip_ver" >/dev/null 2>&1 \
-        || { bad "uv pip install mlx==$pip_ver failed"; return 1; }
-
-    local src
-    src="$(find "$tmp/venv" -path "*/mlx/lib/mlx.metallib" -print -quit 2>/dev/null)"
-    [ -n "$src" ] || src="$(find "$tmp/venv" -name "mlx.metallib" -print -quit 2>/dev/null)"
-    if [ -z "$src" ]; then
-        bad "mlx.metallib not found inside the mlx==$pip_ver wheel"
-        return 1
-    fi
-
-    mkdir -p "$dest_a" "$dest_b"
-    for dest in "$dest_a" "$dest_b"; do
-        cp "$src" "$dest/mlx.metallib"     || { bad "copy to $dest failed"; return 1; }
-        cp "$src" "$dest/default.metallib" || { bad "copy to $dest failed"; return 1; }
-    done
-    ok "metallib installed in metallib/ and $BUILD_REAL_REL"
+    [ "$MODE" = plan ] && { work "override pyrender's stale pyopengl pin ($GL_MIN)"; return 0; }
+    work "overriding pyrender's stale pyopengl pin ($GL_MIN)"
+    # Not fatal: this build's own output is untextured, and an untextured
+    # render works on 3.1.0. It bites the moment a textured GLB from
+    # elsewhere is previewed.
+    "$UV" pip install --python "$PY" --upgrade "$GL_MIN" >/dev/null 2>&1 \
+        || warn "could not upgrade pyopengl — this build's own previews still \
+render, but a textured GLB from elsewhere will not. Retry with: $UV pip \
+install --python $PY --upgrade '$GL_MIN'"
 }
 
 # ---------------------------------------------------------------- phase 5
 download_weights() {
-    phase 5 "model weights"
-    local w="$HY3D_REPO/weights"
-    local need=()
-    [ -d "$w/shape-small" ] || need+=("$SHAPE_HF -> weights/shape-small")
-    [ -d "$w/paint-large" ] || need+=("$PAINT_HF -> weights/paint-large")
-    if [ ${#need[@]} -eq 0 ]; then
-        skip "both weight sets present ($(du -sh "$w" 2>/dev/null | awk '{print $1}'))"
+    phase 5 "model weights — $MODELS_DIR/$SHAPE_HF/$SHAPE_SUB"
+    local dest="$MODELS_DIR/$SHAPE_HF"
+    local ckpt="$dest/$SHAPE_SUB/model.fp16.safetensors"
+    local u2net="$HOME/.u2net/u2net.onnx"
+
+    local need_shape=1 need_u2net=1
+    [ -f "$ckpt" ] && need_shape=0
+    [ -f "$u2net" ] && need_u2net=0
+
+    [ "$need_shape" = 0 ] && skip "shape weights present ($(du -sh "$dest/$SHAPE_SUB" 2>/dev/null | cut -f1))"
+    [ "$need_u2net" = 0 ] && skip "u2net present ($(du -h "$u2net" 2>/dev/null | cut -f1))"
+    [ "$need_shape" = 0 ] && [ "$need_u2net" = 0 ] && return 0
+
+    if [ "$MODE" = plan ]; then
+        [ "$need_shape" = 1 ] && work "download $SHAPE_HF/$SHAPE_SUB (~4.6GB)"
+        [ "$need_u2net" = 1 ] && work "download u2net for rembg (~176MB)"
         return 0
     fi
-    [ "$MODE" = plan ] && { for n in "${need[@]}"; do work "download $n"; done
-                            work "total ~12GB from HuggingFace"; return 0; }
+    [ -x "$PY" ] || { bad "no venv at $ENGINE_VENV — run phase 3 first"; return 1; }
 
-    confirm "download ~12GB of model weights from HuggingFace" || return 0
-
-    local py="$WORKER_VENV/bin/python"
-    [ -x "$py" ] || py="$(command -v python3)"
-    "$py" -c "import huggingface_hub" 2>/dev/null || {
-        work "installing huggingface_hub into the worker venv"
-        ensure_worker_venv_quiet
-        py="$WORKER_VENV/bin/python"
-        uv pip install --python "$py" huggingface_hub >/dev/null 2>&1 \
-            || { bad "could not install huggingface_hub"; return 1; }
-    }
-
-    mkdir -p "$w"
-    local pair
-    for pair in "$SHAPE_HF:shape-small" "$PAINT_HF:paint-large"; do
-        local repo="${pair%%:*}" dir="${pair##*:}"
-        [ -d "$w/$dir" ] && { skip "weights/$dir already there"; continue; }
-        work "downloading $repo (this takes a while)"
-        "$py" - "$repo" "$w/$dir" <<'PY' || { bad "download of $repo failed"; return 1; }
+    if [ "$need_shape" = 1 ]; then
+        confirm "download ~4.6GB of shape weights from HuggingFace" || return 0
+        work "downloading $SHAPE_HF/$SHAPE_SUB (this is the slow one)"
+        # allow_patterns, not a bare snapshot: the same repo carries the paint
+        # stage. And local_dir into ~/.cache/hy3dgen, because that is the tree
+        # upstream consults before it ever contacts HuggingFace, so a run here
+        # never re-resolves the repo over the network.
+        "$PY" - "$SHAPE_HF" "$SHAPE_SUB" "$dest" <<'PY' || { bad "weight download failed"; return 1; }
 import sys
 from huggingface_hub import snapshot_download
-snapshot_download(repo_id=sys.argv[1], local_dir=sys.argv[2])
+repo, sub, dest = sys.argv[1:4]
+snapshot_download(repo_id=repo, allow_patterns=["%s/*" % sub], local_dir=dest)
 PY
-        ok "weights/$dir"
-    done
+        [ -f "$ckpt" ] && ok "shape weights in place" || { bad "download finished but $ckpt is missing"; return 1; }
+    fi
+
+    if [ "$need_u2net" = 1 ]; then
+        # Load-bearing since the cutout worker took over the fallback key:
+        # without it, concept art with a busy background has no path.
+        work "fetching u2net for the cutout fallback (~176MB)"
+        "$PY" -c "from rembg import new_session; new_session('u2net')" >/dev/null 2>&1 \
+            || warn "could not prefetch u2net — it will download on first use instead"
+        [ -f "$u2net" ] && ok "u2net cached at $u2net"
+    fi
 }
 
 # ---------------------------------------------------------------- phase 6
-relayout_paint() {
-    phase 6 "paint-large layout"
-    local p="$HY3D_REPO/weights/paint-large"
-    if [ ! -d "$p" ]; then
-        skip "paint-large not downloaded yet"
-        return 0
-    fi
-    if [ -e "$p/hunyuan3d-paint-v2-0/vae" ] && [ -e "$p/hunyuan3d-paintpbr-v2-1/vae" ] \
-       && [ -e "$p/dinov2-giant" ]; then
-        skip "already nested correctly"
-        return 0
-    fi
-    [ "$MODE" = plan ] && { work "symlink the flat HF layout into the nested one the binary expects"; return 0; }
+verify() {
+    phase 6 "verify"
+    [ "$MODE" = plan ] && { work "import the pipeline, check CUDA, render one offscreen pixel"; return 0; }
+    [ -x "$PY" ] || { bad "no venv at $ENGINE_VENV — run phase 3 first"; return 1; }
 
-    # The HF repo ships flat (vae/, unet/, dinov2/) but the binary looks for
-    # them nested under per-model directories, and under dinov2-giant.
-    work "relinking"
-    ( cd "$p" || exit 1
-      mkdir -p hunyuan3d-paint-v2-0 hunyuan3d-paintpbr-v2-1
-      for model in hunyuan3d-paint-v2-0 hunyuan3d-paintpbr-v2-1; do
-          for part in vae unet; do
-              [ -e "$model/$part" ] || ln -s "../$part" "$model/$part"
-          done
-      done
-      [ -e dinov2-giant ] || ln -s dinov2 dinov2-giant
-    ) || { bad "relayout failed"; return 1; }
-    ok "nested layout in place"
-}
-
-# ---------------------------------------------------------------- phase 7
-ensure_worker_venv_quiet() {
-    [ -x "$WORKER_VENV/bin/python" ] && return 0
-    mkdir -p "$(dirname "$WORKER_VENV")"
-    uv venv "$WORKER_VENV" >/dev/null 2>&1
-}
-
-worker_venv() {
-    phase 7 "worker python environment — $WORKER_VENV"
-    local py="$WORKER_VENV/bin/python"
-
-    # An existing HY3D_PY that already satisfies the imports is the environment
-    # the server is actually configured to use; don't build a second one.
-    if [ -n "${HY3D_PY:-}" ]; then
-        local configured="${HY3D_PY/#\~/$HOME}"
-        # The GL floor joins the skip test so a re-run repairs a venv that has
-        # every package but the stale pin — otherwise the phase skips forever.
-        if [ -x "$configured" ] && "$configured" -c "$WORKER_IMPORT" 2>/dev/null \
-           && "$configured" -c "$WORKER_GL_CHECK" 2>/dev/null; then
-            skip "HY3D_PY already satisfies every worker package ($configured)"
-            WORKER_VENV="$(dirname "$(dirname "$configured")")"
-            return 0
-        fi
+    local out
+    out="$("$PY" - "$ENGINE_REPO" <<'PY' 2>&1
+import sys
+sys.path.insert(0, sys.argv[1])
+import torch
+print("TORCH", torch.__version__)
+print("CUDA", torch.cuda.is_available())
+if torch.cuda.is_available():
+    print("DEVICE", torch.cuda.get_device_name(0))
+from hy3dgen.shapegen import Hunyuan3DDiTFlowMatchingPipeline  # noqa: F401
+print("PIPELINE ok")
+PY
+)"
+    printf '%s\n' "$out" | grep -q "PIPELINE ok" \
+        && ok "engine imports ($(printf '%s' "$out" | grep '^TORCH' | cut -d' ' -f2))" \
+        || bad "engine import failed:
+$(printf '%s' "$out" | tail -5)"
+    if printf '%s\n' "$out" | grep -q "^CUDA True"; then
+        ok "$(printf '%s' "$out" | grep '^DEVICE' | cut -d' ' -f2-)"
+    else
+        bad "torch does not see the GPU. The venv may hold the CPU wheel —
+        \`$PY -c 'import torch; print(torch.__version__)'\` must end in +cu124."
     fi
 
-    if [ -x "$py" ] && "$py" -c "$WORKER_IMPORT" 2>/dev/null \
-       && "$py" -c "$WORKER_GL_CHECK" 2>/dev/null; then
-        skip "already has every worker package"
-        return 0
-    fi
-    [ "$MODE" = plan ] && { work "create venv and install ${WORKER_PKGS[*]} (~400MB)"; return 0; }
+    # pymeshlab's failure mode is a lie ("Unknown format for load: ply"), so
+    # prove decimation rather than the import.
+    "$PY" - <<'PY' >/dev/null 2>&1
+import pymeshlab, numpy as np
+m = pymeshlab.MeshSet()
+v = np.array([[0.,0,0],[1,0,0],[0,1,0],[0,0,1]])
+f = np.array([[0,1,2],[0,1,3],[0,2,3],[1,2,3]])
+m.add_mesh(pymeshlab.Mesh(v, f))
+m.meshing_decimation_quadric_edge_collapse(targetfacenum=2)
+PY
+    [ $? -eq 0 ] && ok "pymeshlab decimates" \
+        || bad "pymeshlab cannot decimate — this is almost always the missing
+        system library, not the wheel: sudo apt install libopengl0"
 
-    if [ ! -x "$py" ]; then
-        work "creating venv"
-        ensure_worker_venv_quiet || { bad "uv venv failed"; return 1; }
-    fi
-    work "installing ${WORKER_PKGS[*]}"
-    # uv, not pip: uv-created venvs have no pip in them at all.
-    uv pip install --python "$py" "${WORKER_PKGS[@]}" >/dev/null 2>&1 \
-        || { bad "package install failed — retry with: uv pip install --python $py ${WORKER_PKGS[*]}"; return 1; }
-
-    # Separate pass on purpose: resolving this alongside pyrender fails, so it
-    # has to land after pyrender has pulled in the 3.1.0 it asks for.
-    work "overriding pyrender's stale pyopengl pin ($WORKER_GL_MIN)"
-    # Not fatal: only render_preview needs this. Generation drives the Swift
-    # binary and the cv2/trimesh workers, none of which touch pyopengl.
-    uv pip install --python "$py" --upgrade "$WORKER_GL_MIN" >/dev/null 2>&1 \
-        || warn "could not upgrade pyopengl — generation is unaffected, but \
-render_preview will fall back to the paint pass's contact sheets on every \
-textured mesh. Retry with: uv pip install --python $py --upgrade $WORKER_GL_MIN"
-
-    "$py" -c "$WORKER_GL_CHECK" 2>/dev/null \
-        && ok "pyopengl clears the render floor ($WORKER_GL_MIN)" \
-        || warn "pyopengl still below $WORKER_GL_MIN — render_preview will use contact sheets"
-
-    "$py" -c "$WORKER_IMPORT" 2>/dev/null \
-        && ok "all worker packages import" \
-        || bad "packages installed but the import check still fails"
+    # An import proves nothing about EGL: the failure is inside the draw call
+    # ("Attempt to retrieve context when no valid context"), so make a context
+    # and render an actual pixel.
+    "$PY" - <<'PY' >/dev/null 2>&1
+import os
+os.environ.setdefault("PYOPENGL_PLATFORM", "egl")
+import numpy as np, trimesh, pyrender
+s = pyrender.Scene()
+s.add(pyrender.Mesh.from_trimesh(trimesh.creation.box()))
+s.add(pyrender.PerspectiveCamera(yfov=1.0), pose=np.array(
+    [[1.,0,0,0],[0,1,0,0],[0,0,1,4],[0,0,0,1]]))
+r = pyrender.OffscreenRenderer(8, 8)
+r.render(s)
+r.delete()
+PY
+    [ $? -eq 0 ] && ok "offscreen rendering works (EGL)" \
+        || warn "offscreen rendering failed — generation is unaffected, but
+        render_preview will not rasterise. Check: sudo apt install libegl1"
 }
 
 # ----------------------------------------------------------------- driver
-say "${DIM}hy3d engine setup${RST}"
-say "  engine repo : $HY3D_REPO"
-say "  worker venv : $WORKER_VENV"
+say "${DIM}hy3d engine setup — shape-only, CUDA${RST}"
+say "  engine repo : $ENGINE_REPO"
+say "  engine venv : $ENGINE_VENV"
+say "  weights     : $MODELS_DIR/$SHAPE_HF"
 [ "$MODE" = plan ] && say "  ${YEL}plan only — nothing will be executed${RST}"
 
 wanted 1 && preflight
@@ -412,11 +419,10 @@ if [ "$FAILED" = 1 ] && [ -z "$ONLY" ]; then
     exit 1
 fi
 wanted 2 && clone_engine
-wanted 3 && build_binary
-wanted 4 && install_metallib
+wanted 3 && build_venv
+wanted 4 && engine_deps
 wanted 5 && download_weights
-wanted 6 && relayout_paint
-wanted 7 && worker_venv
+wanted 6 && verify
 
 say ""
 if [ "$MODE" = plan ]; then
@@ -431,7 +437,7 @@ fi
 say "${GRN}setup complete.${RST}"
 say ""
 say "Point the MCP server at this environment:"
-say "  HY3D_REPO=$HY3D_REPO"
-say "  HY3D_PY=$WORKER_VENV/bin/python"
+say "  HY3D_ENGINE_REPO=$ENGINE_REPO"
+say "  HY3D_ENGINE_PY=$ENGINE_VENV/bin/python"
 say ""
 say "Then call the ${DIM}server_status${RST} tool — every check should report ok."

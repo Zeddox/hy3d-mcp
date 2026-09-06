@@ -31,7 +31,7 @@ ENGINE_REPO = Path(os.environ.get(
     "HY3D_ENGINE_REPO", "~/git/repos/Hunyuan3D-2")).expanduser()
 ENGINE_PY = Path(os.environ.get(
     "HY3D_ENGINE_PY", "~/.hy3d/engine-venv/bin/python")).expanduser()
-# Defaults to the engine venv rather than a second one. provision-engine.sh
+# Defaults to the engine venv rather than a second one. install.sh
 # builds a single environment that already carries the worker stack
 # (numpy/PIL/trimesh/scipy/cv2/pygltflib/pyrender), so splitting it here
 # would only invent a venv that is never created. Still overridable: the
@@ -49,6 +49,30 @@ WORKERS = Path(__file__).parent / "workers"
 # under ENGINE_PY, never imported -- the engine venv has torch, this one
 # does not, and the only thing crossing between them is argv and stdout.
 ENGINE_CLI = Path(__file__).parent / "engine_cli.py"
+
+
+def _find_installer() -> Path | None:
+    """install.sh, from a source checkout or from an installed wheel.
+
+    Shipped inside the package by force-include so a plugin install has one
+    too, but a checkout keeps the copy at the repo root authoritative: that
+    is the one a user reads, edits and re-runs by hand.
+    """
+    here = Path(__file__).resolve()
+    for cand in (here.parents[2] / "install.sh",   # src/hy3d_mcp/ -> repo root
+                 here.parent / "install.sh"):      # inside the wheel
+        if cand.is_file():
+            return cand
+    return None
+
+
+INSTALLER = _find_installer()
+# The installer's own phase numbers, restated because setup_engine(only=N)
+# passes them straight through and has to be able to name them.
+SETUP_PHASES = {1: "preflight", 2: "engine checkout", 3: "venv + torch",
+                4: "python deps", 5: "weights", 6: "verify"}
+# Phase 5 pulls ~4.8GB. Everything else is minutes at worst.
+SETUP_TIMEOUT = 3600.0
 
 # A runaway backstop, not a normal bound: shape at octree 384 runs ~2
 # minutes on a 3060 Ti, but a run that has spilled into host RAM crawls at
@@ -661,12 +685,12 @@ def _server_status() -> dict:
     repo = _check(
         (ENGINE_REPO / "hy3dgen" / "shapegen").is_dir(),
         "Hunyuan3D-2 checkout not found at %s — run "
-        "`bash scripts/provision-engine.sh`, or set HY3D_ENGINE_REPO to an "
+        "`bash install.sh`, or set HY3D_ENGINE_REPO to an "
         "existing checkout" % ENGINE_REPO)
 
     engine_ok = False
     engine_fix = ("engine venv not found at %s — run "
-                  "`bash scripts/provision-engine.sh`" % ENGINE_PY)
+                  "`bash install.sh`" % ENGINE_PY)
     cuda: dict = {"ok": False, "fix": "engine venv missing, so CUDA is unverified"}
     # One probe covers both: the imports the driver needs, and whether torch
     # can actually see the card. A CPU-only wheel imports perfectly and then
@@ -684,7 +708,7 @@ def _server_status() -> dict:
         if not engine_ok:
             engine_fix = (
                 "engine venv at %s is missing packages: %s — re-run "
-                "`bash scripts/provision-engine.sh`, which installs them in "
+                "`bash install.sh`, which installs them in "
                 "the order that matters (torch from the cu124 index, numpy<2, "
                 "and scikit-image, which upstream needs for marching cubes "
                 "but does not declare)"
@@ -720,20 +744,31 @@ def _server_status() -> dict:
                     "engine driver missing at %s — reinstall the server "
                     "package" % ENGINE_CLI)
 
-    # Weights live in the HF cache, not the checkout: the driver names a repo
-    # id and lets huggingface_hub resolve it. Absent means a ~5GB download on
-    # first generate, which is worth knowing before a call appears to hang.
-    hf = Path(os.environ.get("HF_HOME", Path.home() / ".cache/huggingface"))
-    cached = list((hf / "hub").glob("models--tencent--Hunyuan3D-2*")) \
-        if (hf / "hub").is_dir() else []
+    # Two places, in upstream's own order: hy3dgen/shapegen/utils.py consults
+    # $HY3DGEN_MODELS (default ~/.cache/hy3dgen) and only falls back to
+    # snapshot_download, which lands in the HF cache. Look for the checkpoint
+    # itself -- an empty models--tencent--Hunyuan3D-2 directory is left behind
+    # by any metadata call, and globbing for the directory reads that as a hit.
+    models = Path(os.environ.get("HY3DGEN_MODELS",
+                                 Path.home() / ".cache/hy3dgen")).expanduser()
+    hub = Path(os.environ.get("HF_HOME",
+                              Path.home() / ".cache/huggingface")).expanduser() / "hub"
+    ckpt = "model.fp16.safetensors"
+    found: Path | None = models / "tencent/Hunyuan3D-2/hunyuan3d-dit-v2-0" / ckpt
+    if not found.is_file():
+        found = next((p for p in hub.glob(
+            "models--tencent--Hunyuan3D-2/snapshots/*/hunyuan3d-dit-v2-0/" + ckpt)), None)
     weights = _check(
-        bool(cached),
-        "no Hunyuan3D weights in the HF cache at %s — the first generate_model "
-        "call will download ~5GB before it starts, which looks like a hang. "
-        "Pre-fetch it, or just budget for the first call being long" % (hf / "hub"))
+        found is not None,
+        "no Hunyuan3D shape checkpoint under %s or %s — the first "
+        "generate_model call downloads ~4.6GB before it starts, which looks "
+        "like a hang. Pre-fetch it with `bash install.sh --only 5`, or budget "
+        "for a long first call" % (models, hub))
+    if found is not None:
+        weights["path"] = str(found.parent)
 
     venv_ok = False
-    venv_fix = ("worker venv missing: run `bash scripts/provision-engine.sh`, "
+    venv_fix = ("worker venv missing: run `bash install.sh`, "
                 "or set HY3D_PY to a python with cv2/numpy/trimesh/PIL/scipy/"
                 "pygltflib")
     preview_ok = False
@@ -782,9 +817,20 @@ def _server_status() -> dict:
                            "resolving it alongside pyrender fails, so it must "
                            "be a separate upgrade" % (gl, HY3D_PY))
 
+    # Load-bearing since the cutout worker took over the fallback key: without
+    # these, a busy-background concept has no local path at all, and rembg
+    # fetches 176MB in the middle of a generation, which reads as a stall.
+    u2 = Path(os.environ.get("U2NET_HOME", Path.home() / ".u2net")).expanduser()
+    cutout_weights = _check(
+        (u2 / "u2net.onnx").is_file(),
+        "u2net weights not cached at %s — concept art with a busy background "
+        "falls back to a 176MB download mid-job the first time one appears. "
+        "Pre-fetch it with `bash install.sh --only 5`" % (u2 / "u2net.onnx"))
+
     return {
         "engine_repo_ok": repo, "engine_venv_ok": _check(engine_ok, engine_fix),
         "cuda_ok": cuda, "driver_ok": driver, "weights_cached": weights,
+        "cutout_weights_cached": cutout_weights,
         "venv_ok": _check(venv_ok, venv_fix),
         "preview_ok": _check(preview_ok, preview_fix),
         "textured_output": False,
@@ -833,21 +879,56 @@ def server_status() -> dict:
 
 @mcp.tool
 def setup_engine(confirm: bool = False, only: int | None = None) -> dict:
-    """Not automated yet on this platform — returns the command to run.
+    """Install or repair the engine. Dry-run first; nothing runs uninvited.
 
-    The CUDA provisioner exists as `scripts/provision-engine.sh` and is
-    idempotent, but it does not yet speak the phase-by-phase, dry-run-first
-    protocol this tool's contract promises, and a half-honoured contract is
-    worse than an honest pointer. Wiring it up is the next phase of the
-    port.
+    Called with no arguments it runs the installer in plan mode and returns
+    what *would* happen, so the user can see the download sizes before
+    agreeing to them. Call again with confirm=True to execute.
+
+    Phases, addressable individually with only=N:
+
+      1 preflight     GPU, driver, uv, disk, system GL libraries
+      2 checkout      clone Hunyuan3D-2 at the pinned commit
+      3 venv + torch  python 3.10 and the cu124 wheels (~3GB)
+      4 deps          the shape-only package set (~2GB)
+      5 weights       shape checkpoint (~4.6GB) and u2net (~176MB)
+      6 verify        import the pipeline, prove CUDA, decimation and EGL
+
+    Every phase inspects before it acts, so re-running after a failure
+    resumes rather than restarts, and only=5 is the way to pre-fetch the
+    weights without touching anything else.
+
+    Two things it will not do: install system packages (those need root — it
+    prints the exact `sudo apt install` line instead), and install an NVIDIA
+    driver. Inside WSL the Windows driver is projected in, and installing one
+    in the guest breaks it.
     """
-    raise RuntimeError(
-        "automated setup is not wired up on the CUDA build yet. Run this in a "
-        "shell from the repo root, then call server_status:\n\n"
-        "    bash scripts/provision-engine.sh\n\n"
-        "It clones Hunyuan3D-2, builds the engine venv with the cu124 torch "
-        "wheels, and is safe to re-run — it inspects before acting. Note it "
-        "needs the system package `libopengl0` for pymeshlab's mesh IO.")
+    if INSTALLER is None:
+        raise RuntimeError(
+            "install.sh not found beside the package or at the repo root. "
+            "Clone the repo and run `bash install.sh` from it.")
+    if only is not None and only not in SETUP_PHASES:
+        raise ValueError("only must be one of %s (%s)"
+                         % (sorted(SETUP_PHASES),
+                            ", ".join("%d %s" % kv for kv in SETUP_PHASES.items())))
+    argv = [str(INSTALLER), "--yes" if confirm else "--plan"]
+    if only is not None:
+        argv += ["--only", str(only)]
+    started = time.monotonic()
+    proc = subprocess.run(["bash"] + argv, capture_output=True, text=True,
+                          timeout=SETUP_TIMEOUT, cwd=str(INSTALLER.parent))
+    seconds = round(time.monotonic() - started, 1)
+    _record_job("setup_engine", "phase %s" % (only or "all"),
+                proc.returncode == 0, seconds)
+    out = {"ran": bool(confirm), "phase": only, "ok": proc.returncode == 0,
+           "seconds": seconds, "output": proc.stdout.strip()[-6000:]}
+    if proc.returncode != 0:
+        out["stderr"] = proc.stderr.strip()[-2000:]
+    if not confirm:
+        out["note"] = ("this was a dry run — nothing was installed. Call "
+                       "setup_engine(confirm=True) to execute it, or "
+                       "confirm=True with only=N for a single phase.")
+    return out
 
 
 def main() -> None:

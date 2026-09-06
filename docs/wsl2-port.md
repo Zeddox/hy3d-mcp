@@ -350,3 +350,66 @@ than incidental — it downloads silently on first use, so the installer
 prefetches it and `server_status` checks for it. And the engine's own rembg
 is now a safety net for one case only: a `HY3D_PY` pointed at an interpreter
 that cannot import rembg. The stage line says so when it happens.
+
+## Phase 4: the installer, and what it caught
+
+The Phase 2 notes above say `setup_engine` returns a command instead of
+running one, and that `provision-engine.sh` builds the environment. Both
+are now superseded: `install.sh` is the CUDA installer, `provision-engine.sh`
+is gone, and `setup_engine` runs the installer under the dry-run-first
+contract it always promised.
+
+**Writing the installer proved the environment was not reproducible.** The
+discriminating check took one command — diff the packages the provisioner
+names against the modules the workers actually import:
+
+    pyrender       *** MISSING from installer ***
+    PyOpenGL       *** MISSING from installer ***
+
+Both were on this box because they were hand-installed while fixing EGL in
+Phase 2, and `server_status` had been green ever since. A fresh provision
+would have produced a box where `render_preview` could not rasterise, and
+nothing in the setup path would have said so. Neither were the two apt
+packages (`libopengl0`, `libegl1`) named anywhere. "It works here" is not
+evidence that an installer is complete, and the only way to find that out
+is to enumerate rather than to test.
+
+That is also why the pyopengl-3.1.0 machinery inherited from the macOS
+build stays. It looks stale — this venv has 3.1.10 and renders textured
+meshes fine — but it looks stale *because someone fixed it by hand*. A
+fresh install is exactly where pyrender drags its pin back in, so
+`install.sh` still overrides it in a separate pass (resolving the two
+together is reported unsatisfiable) and `server_status` still gates on
+`>= 3.1.7`.
+
+**Verify phase 6 proves, it does not import.** Three of this port's
+failures were invisible to an import check: torch imports perfectly when it
+is the CPU wheel and runs a hundred times slower; pymeshlab imports and
+then reports `Unknown format for load: ply` when `libOpenGL.so.0` is
+missing; pyrender imports and then dies inside the draw call with no EGL
+platform. So phase 6 runs a real decimation and renders an actual offscreen
+pixel.
+
+**`weights_cached` was reporting a false green.** It globbed the HF hub
+cache for `models--tencent--Hunyuan3D-2*`, which any metadata call leaves
+behind as an empty directory. Meanwhile the real weights were never there:
+`hy3dgen/shapegen/utils.py` consults `$HY3DGEN_MODELS` (default
+`~/.cache/hy3dgen/<repo>/<subfolder>`) *before* it asks HuggingFace, so a
+4.6GB checkpoint sits at a path the check never looked at. It now looks for
+`model.fp16.safetensors` in both places, and reports which one it found.
+
+**`server_status` gained `cutout_weights_cached`.** Phase 3 made u2net
+load-bearing, and rembg downloads it silently on first use — 176MB
+arriving in the middle of a generation, which reads as a stall rather than
+a download. Phase 5 of the installer prefetches it.
+
+**Phase numbers are a contract.** `setup_engine(only=N)` passes the number
+straight through to `--only N`, so the six phases are named in the tool's
+docstring and in the installer's header, and an unknown number is now
+rejected. The original silently ran nothing and printed "setup complete",
+which is indistinguishable from a clean install.
+
+The installer does not use sudo. The two system libraries need root and
+nothing else in the install does, so preflight reports the exact
+`sudo apt install libopengl0 libegl1` line and phase 6 proves whether they
+are actually working.

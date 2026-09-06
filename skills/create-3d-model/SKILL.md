@@ -28,9 +28,11 @@ Call `server_status` once before the first generation. Don't re-check on
 later calls.
 
 If any check is `ok: false`, relay that check's `fix` text to the user
-verbatim — every failure carries its exact remedy. Setup is not automated
-on this build: `setup_engine` returns the one command to run
-(`bash scripts/provision-engine.sh`) rather than running it.
+verbatim — every failure carries its exact remedy. `setup_engine` can
+repair most of them: called bare it dry-runs and returns the plan, and only
+executes on a second call with `confirm=true`. Show the user the plan
+before confirming. It cannot install system packages — those need root, so
+it hands back the exact `sudo apt install` line for the user to run.
 
 Read `cuda_ok` even when everything passes. It reports free VRAM, and the
 WSL2 failure mode is not a clean out-of-memory error: the driver serves

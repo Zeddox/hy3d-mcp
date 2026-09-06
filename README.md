@@ -1,23 +1,22 @@
 # hy3d-mcp
 
-> **This branch (`wsl2-cuda-port`) targets WSL2 + NVIDIA CUDA, not Apple
-> Silicon.** The server now drives upstream
-> [Hunyuan3D-2](https://github.com/Tencent/Hunyuan3D-2) (PyTorch) through
-> `scripts/provision-engine.sh`, and it generates **shape only** — the
-> texture pass needs more VRAM than an 8GB consumer card has, so
-> `paint_mesh` refuses rather than half-running. Everything below the
-> Requirements heading still describes the macOS/MLX build and has not been
-> rewritten yet; the installer and this README are the next phase of the
-> port. For setup on this branch: `bash scripts/provision-engine.sh`, then
-> call the `server_status` tool. See [`docs/wsl2-port.md`](docs/wsl2-port.md)
-> for what carried over and what did not.
+An MCP server that turns a single concept image into a game-ready 3D mesh
+(GLB), fully locally on an NVIDIA GPU under WSL2 or Linux, by driving
+[Hunyuan3D-2](https://github.com/Tencent/Hunyuan3D-2) (PyTorch). One tool
+call: background cutout → shape → decimation → watertight GLB. A second
+call exports print-ready STL.
 
-An MCP server that turns a single concept image into a game-ready textured
-3D model (GLB), fully locally on Apple Silicon, by wrapping the
-[Hunyuan3D-MLX](https://github.com/ZimengXiong/hunyuan3d-mlx) pipeline
-(Swift + MLX). One tool call: background cutout → shape → PBR paint →
-optional game-look finishing pass. Proven in production on a real game
-fleet.
+**Shape only — the output has no texture.** The texture stage needs far
+more VRAM than an 8GB consumer card has, so `paint_mesh` refuses with an
+explanation rather than half-running. Carved ornament in your concept art
+comes back as smooth surface; that is what normal and displacement maps are
+for, applied later. This is a property of the shape model, not a tuning
+failure — `octree` is a tessellation-density dial, not a detail dial, and
+raising it recovers no relief.
+
+This branch is a port of the original Apple Silicon / MLX server. See
+[`docs/wsl2-port.md`](docs/wsl2-port.md) for what carried over, what did
+not, and every measurement behind the numbers below.
 
 Models land as **file paths**, never blobs — importing them into your
 engine is the caller's job (for Godot: copy into the project and run
@@ -25,17 +24,21 @@ engine is the caller's job (for Godot: copy into the project and run
 
 ## Requirements
 
-- Apple Silicon Mac with ~48GB unified memory (texture paint peaks
-  ~25–33GB)
-- Xcode or the Command Line Tools (for `swift`), and
-  [uv](https://docs.astral.sh/uv/)
-- ~15GB free disk: 12GB of weights, 1.3GB of build output
-- A built [Hunyuan3D-MLX](https://github.com/ZimengXiong/hunyuan3d-mlx)
-  checkout and a worker Python environment — **[`./install.sh`](#set-up-the-engine)
-  builds both for you**; see that section before doing any of it by hand.
+- An NVIDIA GPU with 8GB or more, under WSL2 or Linux. Developed and
+  measured on an RTX 3060 Ti (8GB), driver 610.62.
+- [uv](https://docs.astral.sh/uv/), git, and python3
+- ~13GB free disk: 4.6GB of weights, ~7GB of venv (the cu124 torch wheels
+  are most of it)
+- Two system libraries: `sudo apt install libopengl0 libegl1`
+- A Hunyuan3D-2 checkout and an engine venv — **[`./install.sh`](#set-up-the-engine)
+  builds both**
 
-The server itself carries no ML dependencies; it shells out to the Swift
-binary and the worker venv.
+Never install an NVIDIA driver inside the WSL guest. The Windows driver is
+projected in through `/usr/lib/wsl/lib`; installing one in the guest breaks
+it.
+
+The server itself carries no ML dependencies; it shells out to the engine
+venv.
 
 ## Install as a Claude Code plugin (recommended)
 
@@ -67,174 +70,156 @@ Register with your MCP client (e.g. in `.mcp.json` or Claude Code's
   "command": "uv",
   "args": ["run", "--project", "~/git/repos/hy3d-mcp", "hy3d-mcp"],
   "env": {
-    "HY3D_REPO": "~/git/repos/hunyuan3d-mlx",
-    "HY3D_PY": "~/.hy3d/worker-venv/bin/python",
+    "HY3D_ENGINE_REPO": "~/git/repos/Hunyuan3D-2",
+    "HY3D_ENGINE_PY": "~/.hy3d/engine-venv/bin/python",
     "HY3D_OUT": "~/hy3d-output"
   }
 }
 ```
 
-All three env vars are optional; the values above are the defaults.
-`HY3D_PY` is any python interpreter with the worker packages installed.
+All are optional; the values above are the defaults. `HY3D_PY` (the
+interpreter the mesh/image workers run under) defaults to
+`HY3D_ENGINE_PY`, since the engine venv already carries the whole worker
+stack — set it only if you want the workers somewhere else.
 
 ## Set up the engine
 
-The server is a thin wrapper — the actual pipeline is a separate Swift
-checkout that has to be cloned, built, and fed 12GB of weights. Either
-let the installer do it or follow the manual sequence below; both end at
-the same place.
-
-### The installer
+The server is a thin wrapper — the actual pipeline is a separate checkout
+that has to be cloned, given a python environment, and fed 4.6GB of
+weights.
 
 ```sh
 ./install.sh --plan     # print exactly what it would do, change nothing
-./install.sh            # do it, confirming the build and the download
+./install.sh            # do it, confirming the download
 ```
 
-Seven phases — preflight, clone, `swift build`, metallib, weights,
-paint-large relayout, worker venv. **Every phase inspects before it
-acts**, so it is safe to re-run: finished work is skipped and a failed
-run resumes where it stopped. The cheap and idempotent phases run
-unattended; the two expensive ones (a ~4 minute build, a ~12GB download)
-stop and ask first. `--yes` runs unattended, `--only N` runs one phase,
-and `--repo` / `--worker-venv` relocate the targets.
+Six phases:
 
-From inside an MCP client, the `setup_engine` tool is the same script.
-It defaults to a dry run and returns the plan; it only executes when
-called again with `confirm=true`, so the agent has to show you the cost
-before spending it.
+| | | |
+|---|---|---|
+| 1 | preflight | GPU, driver, uv, disk, system GL libraries |
+| 2 | checkout | clone Hunyuan3D-2 at the pinned commit |
+| 3 | venv + torch | python 3.10 and the cu124 wheels (~3GB) |
+| 4 | deps | the shape-only package set (~2GB) |
+| 5 | weights | shape checkpoint (~4.6GB) and u2net (~176MB) |
+| 6 | verify | import the pipeline, prove CUDA, decimation and EGL |
 
-When it finishes it prints the `HY3D_REPO` and `HY3D_PY` values to put in
-your MCP config, and `server_status` should then come back all green.
+**Every phase inspects before it acts**, so it is safe to re-run: finished
+work is skipped and a failed run resumes where it stopped. The one
+expensive phase stops and asks first. `--yes` runs unattended, `--only N`
+runs one phase, `--repo` / `--venv` relocate the targets.
 
-### Or by hand
+Phase 6 proves rather than assumes. It imports the pipeline, checks that
+torch actually sees the card, runs a real decimation through pymeshlab,
+and renders an actual offscreen pixel through EGL — because each of those
+fails in a way an import check cannot see.
 
-The engine's own
-[README](https://github.com/ZimengXiong/Hunyuan3D-MLX) covers steps 2–4;
-steps 5–7 are the parts it does not mention.
+It will not install system packages: those need root and the rest does
+not, so it prints the exact `sudo apt install` line instead.
 
-```sh
-# 1. clone
-git clone https://github.com/ZimengXiong/Hunyuan3D-MLX.git ~/git/repos/hunyuan3d-mlx
-cd ~/git/repos/hunyuan3d-mlx
+From inside an MCP client, the `setup_engine` tool is the same script. It
+defaults to a dry run and returns the plan; it only executes when called
+again with `confirm=true`, so the agent has to show you the cost before
+spending it. `setup_engine(confirm=true, only=5)` is the way to pre-fetch
+weights on their own.
 
-# 2. build (~4 min)
-swift build -c release
+When it finishes it prints the values to put in your MCP config, and
+`server_status` should come back all green.
 
-# 3-4. weights (~12GB)
-uvx --from huggingface_hub hf download \
-  zimengxiong/hunyuan3d-mlx-shape-small --local-dir weights/shape-small
-uvx --from huggingface_hub hf download \
-  zimengxiong/hunyuan3d-mlx-paint-large --local-dir weights/paint-large
+## The setup gotchas
 
-# 5. metallib — swift build never emits it; harvest it from the pip mlx wheel.
-#    NOTE: mlx-swift and pip mlx are separate version series. Package.resolved
-#    pins mlx-swift 0.31.4, but no such pip release exists — take the newest
-#    pip mlx in the matching 0.31.x series (0.31.2 at time of writing).
-uv venv /tmp/mlxharvest
-uv pip install --python /tmp/mlxharvest/bin/python mlx==0.31.2
-SRC=$(find /tmp/mlxharvest -name mlx.metallib | head -1)
-for d in metallib .build/arm64-apple-macosx/release; do
-  mkdir -p "$d" && cp "$SRC" "$d/mlx.metallib" && cp "$SRC" "$d/default.metallib"
-done
-
-# 6. paint-large ships flat, the binary wants it nested
-cd weights/paint-large
-mkdir -p hunyuan3d-paint-v2-0 hunyuan3d-paintpbr-v2-1
-ln -s ../vae ../unet hunyuan3d-paint-v2-0/
-ln -s ../vae ../unet hunyuan3d-paintpbr-v2-1/
-ln -s dinov2 dinov2-giant
-cd ../..
-
-# 7. worker venv — uv, not pip: uv-created venvs have no pip in them
-uv venv ~/.hy3d/worker-venv
-uv pip install --python ~/.hy3d/worker-venv/bin/python \
-  opencv-python numpy trimesh pillow scipy pyrender pygltflib
-```
-
-Then set `HY3D_REPO=~/git/repos/hunyuan3d-mlx` and
-`HY3D_PY=~/.hy3d/worker-venv/bin/python`.
-
-**Either way, verify with the `server_status` tool.** It re-checks every
-requirement and each failing check carries its own fix.
-
-## The three setup gotchas
-
-`install.sh` handles all three; they are documented here because they are
+`install.sh` handles all of these; they are documented because they are
 what a by-the-book install of the upstream repo gets wrong, and what
 `server_status` is looking for when it fails.
 
-1. **Metallib** — `swift build` never emits the MLX metallib (mlx-swift
-   SwiftPM limitation). Harvest `mlx.metallib` from the pip `mlx` wheel —
-   *not* the version string in Package.resolved, which is mlx-**swift**'s
-   own series and has no pip counterpart (there is no pip `mlx` 0.31.4).
-   Take the newest pip `mlx` sharing its major.minor, and copy it as both
-   `mlx.metallib` and `default.metallib` into `metallib/` **and** into
-   `.build/arm64-apple-macosx/release/` (the real dir — `.build/release`
-   is a symlink).
-2. **Weight layout** — the paint-large HF repo ships flat, the binary
-   expects nested: symlink `hunyuan3d-paint-v2-0/{vae,unet}` and
-   `hunyuan3d-paintpbr-v2-1/{vae,unet}` → `../vae`, `../unet`, and
-   `dinov2-giant` → `dinov2`, inside `weights/paint-large`.
-3. **Paint model flag** — the server always passes `--paint-model pbr`;
-   the rgb default targets a weight set that isn't installed.
+1. **`scikit-image` is required and undeclared.** Upstream's
+   `requirements.txt` has it commented out, but
+   `shapegen/models/autoencoders/surface_extractors.py` needs it for the
+   default `mc_algo='mc'` path. Omitting it is the first thing that breaks
+   a shape run.
+2. **torch and torchvision must come from the cu124 index in one
+   command.** Installing torchvision from PyPI afterwards silently pulls a
+   different torch and discards the cu124 build — which then imports
+   perfectly and runs on the CPU at a hundredth of the speed.
+3. **`numpy<2`.** pymeshlab wheels of this era are built against the numpy
+   1.x ABI and fail at *import*, not at use.
+4. **`libopengl0`.** pymeshlab dlopens `libOpenGL.so.0` even headless, and
+   Ubuntu ships `libGL.so.1` and `libGLX.so.0` but not that one. Its plugin
+   load fails, taking `io_base` with it, and decimation surfaces as the
+   thoroughly misleading `PyMeshLabException: Unknown format for load: ply`.
+5. **`PYOPENGL_PLATFORM=egl`, set before pyrender is imported.** The
+   platform is read at import time. Without it, headless rendering fails
+   inside the draw call with "Attempt to retrieve context when no valid
+   context" rather than anything about a display.
 
 ## Tools
 
 | Tool | What it does | Typical time |
 | --- | --- | --- |
-| `generate_model` | image → textured GLB (auto cutout, optional finish) | ~3–4 min (shape only: ~20s) |
-| `paint_mesh` | texture a mesh you already have, from a concept image | ~3 min |
-| `prepare_concept` | plain-background image → centered square RGBA | seconds |
-| `finish_model` | game-look texture pass: toned albedo + accent/seam emissive | seconds |
-| `render_preview` | offscreen PNG renders, falling back to the generator's own sheets | seconds |
+| `generate_model` | image → watertight GLB (auto cutout, decimation) | ~3 min |
+| `export_stl` | GLB → print-ready STL, Z-up, scaled to a target height | seconds |
+| `prepare_concept` | concept image → centered square RGBA cutout | seconds |
+| `render_preview` | offscreen PNG renders from any angle | seconds |
 | `server_status` | full setup diagnostic, queue depth, last job | instant |
 | `setup_engine` | runs `install.sh`; dry run unless `confirm=true` | instant (plan) / up to an hour (apply) |
 | `cancel_job` | kill the running engine and free the queue | instant |
+| `finish_model` | game-look texture pass — needs a GLB textured elsewhere | seconds |
+| `paint_mesh` | unavailable on this build; refuses with an explanation | — |
 
 Generation is serialized — one job at a time; concurrent calls queue
-rather than OOM the machine. `generate_model` streams MCP progress
-notifications the whole way through, so a slow job stays distinguishable
-from a hung one, and cancelling the call kills the engine process rather
-than leaving it holding the queue.
+rather than thrash the card. `generate_model` streams MCP progress
+notifications the whole way through (real diffusion steps, not a fake
+clock), so a slow job stays distinguishable from a hung one, and
+cancelling the call kills the engine process rather than leaving it
+holding the queue.
+
+## What a run actually costs
+
+Measured end to end, RTX 3060 Ti, defaults, from a raw garden-scene
+concept with no manual prep:
+
+| | |
+|---|---|
+| wall clock | ~160–185s (~35s model load, ~115s generate, ~11s decimate) |
+| raw mesh | 542k faces |
+| after decimation | 40,000 faces / 20,002 verts, still watertight |
+| attributes | `NORMAL`, `POSITION` |
+| peak VRAM reserved | 6.22 GiB against 6.96 GiB free |
+
+The model reloads on every call — each generation is a fresh subprocess —
+which is where the 35s floor comes from.
 
 ## Notes from production use
 
-- **Outputs carry vertex normals.** The engine writes only `POSITION` and
-  `TEXCOORD_0`; Godot does not synthesise the rest, and lights the whole
-  mesh off one constant vector when `NORMAL` is missing — which presents
-  as a bad material, not a missing attribute, and is expensive to
-  diagnose. `generate_model` and `finish_model` inject it by default
-  (`normals=false` opts out). Injected, not re-exported: a round trip
-  through a mesh library rebuilds the material block and destroys the
-  emissive map the finish pass writes.
-- **Previews degrade rather than fail.** pyrender wants a window-server
-  connection despite the "offscreen" name, and a daemonised MCP server
-  usually has none. When rasterising fails, `render_preview` returns the
-  `<name>.glb.views.png` and `.rendercheck.png` contact sheets the paint
-  pass writes beside every GLB, and marks `source: "generator_sheets"` so
-  you know they're fixed views, not the ones you asked for. Shape-only
-  output has no sheets to fall back on.
-- **`octree` costs scale with concept detail, not just the number.** A
-  smooth-hulled subject at `octree=384` finished in ~6 minutes; a
-  lattice/greeble-heavy one ran 16.5 minutes and pushed the machine deep
-  into swap — and at defaults that same subject resolved its truss braces
-  fine in 790s. Reach for `octree` when thin struts *fuse together*, not
-  as a general quality dial.
-- **Vertex counts vary ~4.5× across subjects at identical settings**
-  (82k for a gun housing, 367k for a trussed deck). There is no knob that
-  trades detail back down; budget for the heavy case, or simplify the
-  concept.
-- **`accent_coverage_pct` near 0 is usually the extractor's range, not
-  your concept.** It keys on saturated red-dominant regions and is tuned
-  for broad accent panels; thin indicator strips score near zero.
-- **Long jobs and client timeouts.** A detailed concept can legitimately
-  paint for 13+ minutes, which exceeds some clients' idle-abort defaults.
-  The progress stream is what keeps those timers alive; if your client
-  still gives up, raise its tool timeout (Claude Code:
-  `CLAUDE_CODE_MCP_TOOL_IDLE_TIMEOUT`, or a per-server `timeout` in MCP
-  settings). If a job is ever abandoned mid-flight, `cancel_job` frees
-  the queue without hunting for a pid.
+- **The WSL2 failure mode is not out-of-memory.** Under WDDM the driver
+  serves oversized allocations out of host RAM instead of failing, so a
+  job that does not fit still finishes, having crawled at PCIe bandwidth.
+  A completed run is therefore not evidence that it fit. Watch
+  `peak_reserved_gib` against `vram_ceiling_gib` in the result;
+  `cpu_offload=true` is the lever when they meet.
+- **Outputs carry vertex normals.** Godot does not synthesise `NORMAL` and
+  lights the whole mesh off one constant vector when it is missing — which
+  presents as a bad material, not a missing attribute, and is expensive to
+  diagnose. The engine writer emits it directly.
+- **`is_watertight` is not the check you want.** Two meshes that both pass
+  it, and render identically, differed 5.6× in enclosed volume: one was a
+  hollow shell. `export_stl` reports `bbox_fill_pct` (volume as a
+  percentage of the bounding box), which is the number that catches it.
+  A solid object sits well above 15%.
+- **`octree` costs scale with concept detail, not just the number.**
+  Raising it from 384 to 512 doubled the wall clock and recovered *no*
+  surface relief — it changed proportions slightly. Reach for it when thin
+  struts *fuse together*, not as a quality dial.
+- **Face counts vary widely at identical settings** (542k–881k raw across
+  subjects). More raw faces is often surface noise, not detail: the 2mini
+  model emits *more* than the full 2.0 and holds edges less crisply.
+  `max_faces` (default 40,000) decimates to a game-ready count and the
+  result stays watertight.
+- **Long jobs and client timeouts.** The progress stream is what keeps a
+  client's idle timer alive; if yours still gives up, raise its tool
+  timeout (Claude Code: `CLAUDE_CODE_MCP_TOOL_IDLE_TIMEOUT`, or a
+  per-server `timeout` in MCP settings). If a job is ever abandoned
+  mid-flight, `cancel_job` frees the queue without hunting for a pid.
 
 ## Input doctrine
 
@@ -242,19 +227,39 @@ than leaving it holding the queue.
   Pre-flattened "albedo-style" input bakes pale and featureless.
 - **No drop shadows** in the source image — they reconstruct as literal
   geometry under the model.
-- Single object, plain background, roughly centered; ¾ view works best.
-  `prepare_concept` / `auto_cutout` handle the background keying.
+- Single object, roughly centered; ¾ view works best. A plain background
+  keeps the cutout on its cheap corner key, but is not required: busy
+  concept art falls back to u2net segmentation plus a largest-component
+  filter, which is what makes real garden-scene art usable without manual
+  prep.
+
+## 3D printing
+
+`export_stl` rotates glTF's Y-up into the Z-up every slicer expects,
+scales to a target height in millimetres (STL is unitless and read as mm),
+and drops the model onto the bed at the origin. It reports enclosed
+volume, bounding-box fill, genus, and four solidity checks, and warns when
+the finest detail in the mesh falls below your nozzle's minimum wall.
 
 ## Non-goals
 
 - No cloud fallback.
-- No mesh post-processing (decimation/repair proved destructive on
-  generated meshes; LODs belong to your engine's importer).
+- No texture stage on this build. Not a philosophical position — an 8GB
+  card cannot run it.
 - No batch tool — loop `generate_model`; the queue serializes.
 - No multiview input **yet** — the pipeline is single-image at every entry
   point. Investigated and specced, not built; see below.
 
 ## Investigations
+
+- [`docs/wsl2-port.md`](docs/wsl2-port.md) — the port itself, phase by
+  phase: what the 8GB budget rules out, how the progress protocol survived
+  the engine swap, why the cutout fallback moved out of the engine, and
+  every measurement quoted above.
+
+The three below predate the port and describe the MLX build. The findings
+about *inputs* still hold — those are properties of the shape model, which
+is the same one — but the routes and costings are macOS-specific.
 
 - [`docs/multiview-routes-2026-08-02.md`](docs/multiview-routes-2026-08-02.md)
   — multi-image → 3D. Three routes costed (native MLX port, ComfyUI hybrid,
@@ -274,11 +279,12 @@ model weights and no Tencent code.
 ### Model weights license (read this)
 
 The pipeline runs on Tencent's Hunyuan3D weights, which you download
-yourself and which are governed by the **Tencent Hunyuan 3D 2.0 / 2.1
-Community License Agreements** ([2.0](https://huggingface.co/tencent/Hunyuan3D-2/blob/main/LICENSE),
-[2.1](https://huggingface.co/tencent/Hunyuan3D-2.1/blob/main/LICENSE)) —
-the paint stage uses both generations, so both apply. Highlights, not
-legal advice; read the licenses:
+yourself and which are governed by the **Tencent Hunyuan 3D 2.0 Community
+License Agreement**
+([2.0](https://huggingface.co/tencent/Hunyuan3D-2/blob/main/LICENSE)).
+This build fetches the shape checkpoint only; the 2.1 paint weights the
+macOS build also used are not downloaded here. Highlights, not legal
+advice; read the license:
 
 - **Territory:** the license does not apply in the European Union, the
   United Kingdom, or South Korea. If you're there, you may not use the
@@ -293,5 +299,6 @@ legal advice; read the licenses:
 - **Your outputs are yours:** Tencent claims no rights to generated 3D
   models; you own them and are responsible for how you use them.
 
-The [Hunyuan3D-MLX](https://github.com/ZimengXiong/Hunyuan3D-MLX) Swift
-port this server shells out to is itself MIT-licensed.
+[Hunyuan3D-2](https://github.com/Tencent/Hunyuan3D-2), the upstream this
+server shells out to, carries Tencent's own license — the code and the
+weights are covered separately, so read both.
