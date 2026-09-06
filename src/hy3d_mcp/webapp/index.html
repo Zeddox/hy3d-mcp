@@ -1,0 +1,527 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>hy3d Workbench</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Zilla+Slab:wght@500;600;700&family=IBM+Plex+Sans:wght@400;500;600&family=IBM+Plex+Mono:wght@400;500&display=swap">
+<style>
+  /* Palette carried over from the Phase 1 shape bench: a cool workshop grey
+     with a pine accent, so the two viewers read as the same instrument. */
+  :root {
+    --ground:   #E6EAE6;
+    --surface:  #F4F7F3;
+    --sunken:   #DDE2DC;
+    --ink:      #171C19;
+    --muted:    #5A645D;
+    --line:     #C4CCC4;
+    --accent:   #2C7666;
+    --accent-in:#FFFFFF;
+    --amber:    #A9631F;
+    --viewport: #DCE1DB;
+    --shadow:   0 1px 2px rgba(23,28,25,.06), 0 8px 24px -16px rgba(23,28,25,.28);
+    --radius:   10px;
+  }
+  @media (prefers-color-scheme: dark) {
+    :root:not([data-theme="light"]) {
+      --ground:   #111512;  --surface: #1A201C;  --sunken: #0C0F0D;
+      --ink:      #E1E7E1;  --muted:   #94A099;  --line:   #2B342F;
+      --accent:   #55AC97;  --accent-in:#0C1512; --amber:  #D4924A;
+      --viewport: #141916;
+      --shadow:   0 1px 2px rgba(0,0,0,.4), 0 10px 30px -18px rgba(0,0,0,.8);
+    }
+  }
+  :root[data-theme="dark"] {
+    --ground:   #111512;  --surface: #1A201C;  --sunken: #0C0F0D;
+    --ink:      #E1E7E1;  --muted:   #94A099;  --line:   #2B342F;
+    --accent:   #55AC97;  --accent-in:#0C1512; --amber:  #D4924A;
+    --viewport: #141916;
+    --shadow:   0 1px 2px rgba(0,0,0,.4), 0 10px 30px -18px rgba(0,0,0,.8);
+  }
+
+  * { box-sizing: border-box; }
+  body {
+    margin: 0; background: var(--ground); color: var(--ink);
+    font: 400 15px/1.5 "IBM Plex Sans", system-ui, -apple-system, sans-serif;
+    -webkit-font-smoothing: antialiased;
+  }
+  h1, h2, h3 { font-family: "Zilla Slab", Georgia, serif; margin: 0; text-wrap: balance; }
+  code, .mono, .stat dd { font-family: "IBM Plex Mono", ui-monospace, monospace; }
+
+  .bar {
+    display: flex; align-items: baseline; gap: 14px; flex-wrap: wrap;
+    padding: 14px 22px; border-bottom: 1px solid var(--line);
+    background: var(--surface);
+  }
+  .bar h1 { font-size: 20px; font-weight: 700; letter-spacing: -.01em; }
+  .bar .sub { color: var(--muted); font-size: 13px; }
+  .bar .gpu { margin-left: auto; font-size: 12.5px; color: var(--muted); }
+  .dot { display: inline-block; width: 8px; height: 8px; border-radius: 50%;
+         background: var(--muted); margin-right: 6px; vertical-align: 1px; }
+  .dot.ok { background: var(--accent); }
+  .dot.bad { background: var(--amber); }
+
+  .shell {
+    display: grid; grid-template-columns: 320px minmax(0, 1fr);
+    gap: 20px; padding: 20px; align-items: start;
+    max-width: 1500px; margin: 0 auto;
+  }
+  @media (max-width: 900px) { .shell { grid-template-columns: 1fr; } }
+
+  .rail { display: flex; flex-direction: column; gap: 16px; }
+  .card {
+    background: var(--surface); border: 1px solid var(--line);
+    border-radius: var(--radius); padding: 14px;
+  }
+  .card > h2 {
+    font-size: 12px; font-weight: 600; letter-spacing: .08em;
+    text-transform: uppercase; color: var(--muted); margin-bottom: 10px;
+    font-family: "IBM Plex Sans", sans-serif;
+  }
+
+  /* The drop target doubles as the input preview, so picking and checking
+     what you picked are the same square. */
+  .drop {
+    border: 1.5px dashed var(--line); border-radius: var(--radius);
+    background: var(--sunken); aspect-ratio: 1; display: grid;
+    place-items: center; text-align: center; padding: 16px; cursor: pointer;
+    color: var(--muted); font-size: 13.5px; position: relative;
+    overflow: hidden; transition: border-color .15s, background .15s;
+  }
+  .drop:hover, .drop.over { border-color: var(--accent); background: var(--surface); }
+  .drop.over { border-style: solid; }
+  .drop img {
+    position: absolute; inset: 0; width: 100%; height: 100%;
+    object-fit: contain; background: var(--sunken);
+  }
+  .drop .hint b { color: var(--ink); font-weight: 600; }
+  .drop input { display: none; }
+
+  .fields { display: grid; grid-template-columns: 1fr 1fr; gap: 10px; }
+  .field { display: flex; flex-direction: column; gap: 4px; }
+  .field label { font-size: 11.5px; color: var(--muted); letter-spacing: .02em; }
+  .field input, .field select {
+    font: 500 13px/1.2 "IBM Plex Mono", monospace; color: var(--ink);
+    background: var(--sunken); border: 1px solid var(--line);
+    border-radius: 6px; padding: 7px 8px; width: 100%;
+  }
+  .field.wide { grid-column: 1 / -1; }
+  details.adv { margin-top: 12px; }
+  details.adv summary {
+    cursor: pointer; font-size: 12.5px; color: var(--muted);
+    list-style: none; padding: 4px 0;
+  }
+  details.adv summary::-webkit-details-marker { display: none; }
+  details.adv summary::before { content: "▸ "; }
+  details.adv[open] summary::before { content: "▾ "; }
+  details.adv .fields { margin-top: 10px; }
+
+  button {
+    font: 600 14px/1 "IBM Plex Sans", sans-serif; cursor: pointer;
+    border-radius: 8px; border: 1px solid var(--line);
+    background: var(--surface); color: var(--ink); padding: 10px 14px;
+  }
+  button:hover:not(:disabled) { border-color: var(--accent); }
+  button:disabled { opacity: .45; cursor: not-allowed; }
+  button.primary {
+    background: var(--accent); color: var(--accent-in); border-color: var(--accent);
+    width: 100%; padding: 12px; font-size: 15px;
+  }
+  button:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
+
+  .gallery-list { display: flex; flex-direction: column; gap: 2px; max-height: 260px; overflow-y: auto; }
+  .gallery-list button {
+    display: flex; justify-content: space-between; gap: 10px; width: 100%;
+    border: none; background: none; padding: 7px 8px; border-radius: 6px;
+    font-weight: 400; font-size: 13px; text-align: left;
+  }
+  .gallery-list button:hover { background: var(--sunken); }
+  .gallery-list .mb { color: var(--muted); font-size: 11.5px; font-family: "IBM Plex Mono", monospace; }
+  .gallery-list .name { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+
+  .stage-col { display: flex; flex-direction: column; gap: 14px; min-width: 0; }
+
+  .run { display: none; }
+  .run.active { display: block; }
+  .run .track {
+    height: 6px; border-radius: 3px; background: var(--sunken);
+    overflow: hidden; border: 1px solid var(--line);
+  }
+  .run .fill { height: 100%; width: 0; background: var(--accent); transition: width .4s ease; }
+  .run .line {
+    display: flex; justify-content: space-between; gap: 12px;
+    margin-top: 7px; font-size: 13px; color: var(--muted);
+  }
+  .run .line .msg { font-family: "IBM Plex Mono", monospace; font-size: 12.5px; }
+
+  .stage {
+    position: relative; background: var(--viewport); border: 1px solid var(--line);
+    border-radius: var(--radius); aspect-ratio: 16 / 10; overflow: hidden;
+    display: grid; place-items: center;
+  }
+  .stage canvas { display: block; width: 100%; height: 100%; }
+  .stage.dragging { cursor: grabbing; }
+  .stage .empty { color: var(--muted); font-size: 14px; padding: 24px; text-align: center; max-width: 42ch; }
+
+  .toolbar { display: flex; gap: 8px; flex-wrap: wrap; align-items: center; }
+  .toolbar .seg { display: flex; border: 1px solid var(--line); border-radius: 8px; overflow: hidden; }
+  .toolbar .seg button { border: none; border-radius: 0; padding: 8px 13px; font-size: 13px; font-weight: 500; }
+  .toolbar .seg button + button { border-left: 1px solid var(--line); }
+  .toolbar .seg button[aria-pressed="true"] { background: var(--accent); color: var(--accent-in); }
+  .toolbar .spacer { margin-left: auto; }
+
+  .stats { display: grid; grid-template-columns: repeat(auto-fit, minmax(118px, 1fr)); gap: 1px;
+           background: var(--line); border: 1px solid var(--line); border-radius: var(--radius);
+           overflow: hidden; margin: 0; }
+  .stats:empty { display: none; }
+  .stat { background: var(--surface); padding: 11px 13px; }
+  .stat dt { font-size: 11px; letter-spacing: .05em; text-transform: uppercase; color: var(--muted); }
+  .stat dd { margin: 3px 0 0; font-size: 17px; font-weight: 500; font-variant-numeric: tabular-nums; }
+  .stat dd .of { color: var(--muted); font-size: 12.5px; }
+  .stat.warn dd { color: var(--amber); }
+
+  .notes { font-size: 13px; color: var(--muted); }
+  .notes .stage-line { font-family: "IBM Plex Mono", monospace; font-size: 12.5px; }
+  .notes .warn { color: var(--amber); }
+
+  .print { display: flex; gap: 10px; align-items: flex-end; flex-wrap: wrap; }
+  .print .field { width: 110px; }
+  a.dl {
+    color: var(--accent); font-weight: 600; font-size: 13.5px; text-decoration: none;
+    border-bottom: 1px solid var(--accent); padding-bottom: 1px;
+  }
+  a.dl:hover { border-bottom-width: 2px; }
+  .notes:empty { display: none; }
+  .checks { display: flex; gap: 8px; flex-wrap: wrap; margin-top: 10px; }
+  .chip {
+    font-size: 12px; padding: 3px 9px; border-radius: 99px;
+    border: 1px solid var(--line); background: var(--sunken); color: var(--muted);
+    font-family: "IBM Plex Mono", monospace;
+  }
+  .chip.pass { color: var(--accent); border-color: var(--accent); }
+  .chip.fail { color: var(--amber); border-color: var(--amber); }
+  .err { color: var(--amber); font-size: 13.5px; white-space: pre-wrap;
+         font-family: "IBM Plex Mono", monospace; }
+  @media (prefers-reduced-motion: reduce) { * { transition: none !important; } }
+</style>
+</head>
+<body>
+
+<header class="bar">
+  <h1>hy3d workbench</h1>
+  <span class="sub">Hunyuan3D-2 · shape only · untextured</span>
+  <span class="gpu" id="gpu"><span class="dot"></span>checking the engine…</span>
+</header>
+
+<main class="shell">
+  <aside class="rail">
+    <section class="card">
+      <h2>Concept</h2>
+      <label class="drop" id="drop">
+        <input type="file" id="file" accept="image/png,image/jpeg,image/webp,image/bmp">
+        <span class="hint" id="hint"><b>Drop an image</b><br>or click to pick · Ctrl+V pastes</span>
+      </label>
+      <p class="notes" style="margin:10px 0 0">One object, plain background, no drop
+        shadow. The background gets keyed out and the subject cropped square before
+        it reaches the generator.</p>
+      <details class="adv">
+        <summary>Settings</summary>
+        <div class="fields">
+          <div class="field"><label for="steps">steps</label>
+            <input id="steps" type="number" min="1" max="100" placeholder="50"></div>
+          <div class="field"><label for="octree">octree</label>
+            <input id="octree" type="number" min="64" max="640" step="64" placeholder="384"></div>
+          <div class="field"><label for="max_faces">max faces</label>
+            <input id="max_faces" type="number" min="0" step="1000" value="40000"></div>
+          <div class="field"><label for="seed">seed</label>
+            <input id="seed" type="number" value="42"></div>
+          <div class="field wide"><label for="model">model</label>
+            <select id="model">
+              <option value="">Hunyuan3D-2 (3.3B, solid)</option>
+              <option value="tencent/Hunyuan3D-2mini">2mini (2× faster, can come back hollow)</option>
+            </select></div>
+        </div>
+      </details>
+    </section>
+
+    <button class="primary" id="go" disabled>Generate</button>
+
+    <section class="card">
+      <h2>Outputs</h2>
+      <div class="gallery-list" id="gallery"><p class="notes">nothing generated yet</p></div>
+    </section>
+  </aside>
+
+  <section class="stage-col">
+    <div class="run card" id="run">
+      <div class="track"><div class="fill" id="fill"></div></div>
+      <div class="line">
+        <span class="msg" id="runmsg">starting</span>
+        <span id="runtime">0:00</span>
+      </div>
+    </div>
+
+    <div class="stage" id="stage">
+      <p class="empty" id="stage-empty">No mesh loaded. Drop a concept image on the
+        left to generate one — about two minutes at the default settings — or open
+        something from Outputs.</p>
+    </div>
+
+    <div class="toolbar">
+      <div class="seg" id="shading">
+        <button data-mode="shaded" aria-pressed="true">Shaded</button>
+        <button data-mode="normals" aria-pressed="false">Normals</button>
+        <button data-mode="wire" aria-pressed="false">Wireframe</button>
+      </div>
+      <button id="reset">Reset view</button>
+      <span class="spacer"></span>
+      <button id="cancel" hidden>Cancel run</button>
+      <a class="dl" id="glbdl" hidden download>Download GLB</a>
+    </div>
+
+    <dl class="stats" id="stats"></dl>
+    <p class="notes" id="notes"></p>
+
+    <section class="card" id="printcard" hidden>
+      <h2>3D print</h2>
+      <div class="print">
+        <div class="field"><label for="height">height mm</label>
+          <input id="height" type="number" min="5" max="500" value="120"></div>
+        <div class="field"><label for="wall">min wall mm</label>
+          <input id="wall" type="number" min="0.1" max="5" step="0.1" value="0.8"></div>
+        <button id="stl">Export STL</button>
+        <a class="dl" id="stldl" hidden download>Download STL</a>
+      </div>
+      <div class="checks" id="stlout"></div>
+      <p class="notes" id="stlnotes" style="margin-top:10px"></p>
+    </section>
+  </section>
+</main>
+
+<script type="importmap">
+{"imports": {
+  "three": "https://cdn.jsdelivr.net/npm/three@0.169.0/build/three.module.js",
+  "three/addons/": "https://cdn.jsdelivr.net/npm/three@0.169.0/examples/jsm/"
+}}
+</script>
+<script type="module">
+import * as THREE from "three";
+import { GLTFLoader } from "three/addons/loaders/GLTFLoader.js";
+import { OrbitControls } from "three/addons/controls/OrbitControls.js";
+
+const $ = (id) => document.getElementById(id);
+const state = { file: null, job: null, glb: null, mode: "shaded", meshes: [] };
+
+/* ---------- viewer ---------- */
+const stage = $("stage");
+const renderer = new THREE.WebGLRenderer({ antialias: true, alpha: true });
+renderer.setPixelRatio(Math.min(devicePixelRatio, 2));
+const scene = new THREE.Scene();
+const camera = new THREE.PerspectiveCamera(38, 16 / 10, 0.05, 100);
+const HOME = new THREE.Vector3(1.05, 0.72, 1.55);
+camera.position.copy(HOME);
+scene.add(new THREE.HemisphereLight(0xffffff, 0x6b7a72, 1.4));
+const key = new THREE.DirectionalLight(0xffffff, 1.9); key.position.set(2.2, 3.0, 2.4);
+const rim = new THREE.DirectionalLight(0xffffff, 0.8); rim.position.set(-2.4, 1.0, -1.8);
+scene.add(key, rim);
+const controls = new OrbitControls(camera, renderer.domElement);
+Object.assign(controls, { enableDamping: true, dampingFactor: 0.08, minDistance: 0.7, maxDistance: 6 });
+controls.addEventListener("start", () => stage.classList.add("dragging"));
+controls.addEventListener("end", () => stage.classList.remove("dragging"));
+
+const MATS = {
+  shaded: () => new THREE.MeshStandardMaterial({ color: 0xcfd3cb, roughness: 0.72, metalness: 0 }),
+  normals: () => new THREE.MeshNormalMaterial({ flatShading: true }),
+  wire: () => new THREE.MeshBasicMaterial({ color: 0x4f9e8b, wireframe: true }),
+};
+function applyMode() {
+  for (const m of state.meshes) { m.material?.dispose(); m.material = MATS[state.mode](); }
+}
+function fit() {
+  const w = stage.clientWidth, h = stage.clientHeight;
+  if (!w || !h) return;
+  camera.aspect = w / h; camera.updateProjectionMatrix(); renderer.setSize(w, h, false);
+}
+new ResizeObserver(fit).observe(stage);
+(function loop() { requestAnimationFrame(loop); controls.update(); renderer.render(scene, camera); })();
+
+let current = null;
+function loadGLB(url) {
+  new GLTFLoader().load(url, (gltf) => {
+    if (current) { scene.remove(current); }
+    state.meshes = [];
+    const root = gltf.scene;
+    const box = new THREE.Box3().setFromObject(root);
+    const size = box.getSize(new THREE.Vector3());
+    const mid = box.getCenter(new THREE.Vector3());
+    const s = 1 / Math.max(size.x, size.y, size.z);
+    root.scale.setScalar(s);
+    root.position.set(-mid.x * s, -mid.y * s, -mid.z * s);
+    root.traverse((o) => { if (o.isMesh) state.meshes.push(o); });
+    scene.add(root); current = root;
+    applyMode();
+    $("stage-empty")?.remove();
+    if (!renderer.domElement.parentNode) stage.appendChild(renderer.domElement);
+    fit();
+    state.glb = url;
+    $("glbdl").hidden = false; $("glbdl").href = url;
+    $("printcard").hidden = false;
+    $("stldl").hidden = true; $("stlout").textContent = ""; $("stlnotes").textContent = "";
+  }, undefined, (e) => { $("notes").innerHTML = '<span class="warn">could not load that GLB: ' + e + "</span>"; });
+}
+$("shading").addEventListener("click", (e) => {
+  const b = e.target.closest("button[data-mode]"); if (!b) return;
+  state.mode = b.dataset.mode; applyMode();
+  for (const x of $("shading").children) x.setAttribute("aria-pressed", String(x === b));
+});
+$("reset").addEventListener("click", () => {
+  camera.position.copy(HOME); controls.target.set(0, 0, 0); controls.update();
+});
+
+/* ---------- picking ---------- */
+const drop = $("drop"), fileInput = $("file");
+function takeFile(f) {
+  if (!f || !f.type.startsWith("image/")) return;
+  state.file = f;
+  const img = drop.querySelector("img") || Object.assign(document.createElement("img"), { alt: "" });
+  img.src = URL.createObjectURL(f);
+  if (!img.parentNode) drop.appendChild(img);
+  $("hint").hidden = true;
+  $("go").disabled = false;
+}
+fileInput.addEventListener("change", () => takeFile(fileInput.files[0]));
+["dragenter", "dragover"].forEach((t) => drop.addEventListener(t, (e) => {
+  e.preventDefault(); drop.classList.add("over");
+}));
+["dragleave", "drop"].forEach((t) => drop.addEventListener(t, (e) => {
+  e.preventDefault(); drop.classList.remove("over");
+}));
+drop.addEventListener("drop", (e) => takeFile(e.dataTransfer.files[0]));
+addEventListener("paste", (e) => {
+  for (const item of e.clipboardData.files) { takeFile(item); break; }
+});
+
+/* ---------- running ---------- */
+const num = (n) => n?.toLocaleString?.() ?? n;
+function stat(label, value, cls) {
+  return '<div class="stat' + (cls ? " " + cls : "") + '"><dt>' + label + "</dt><dd>" + value + "</dd></div>";
+}
+function showResult(r) {
+  const spill = r.peak_reserved_gib && r.vram_ceiling_gib &&
+                r.peak_reserved_gib >= r.vram_ceiling_gib - 0.1;
+  $("stats").innerHTML = [
+    stat("faces", num(r.faces) + ' <span class="of">of ' + num(r.raw_faces) + "</span>"),
+    stat("vertices", num(r.verts)),
+    stat("watertight", r.watertight ? "yes" : "no", r.watertight ? "" : "warn"),
+    stat("peak VRAM", (r.peak_reserved_gib ?? "?") + ' <span class="of">/ ' +
+         (r.vram_ceiling_gib ?? "?") + " GiB</span>", spill ? "warn" : ""),
+    stat("wall clock", Math.round(r.seconds) + "s"),
+  ].join("");
+  const bits = [];
+  if (r.stages) bits.push('<span class="stage-line">' + r.stages.join("  →  ") + "</span>");
+  if (r.warning) bits.push('<span class="warn">' + r.warning + "</span>");
+  bits.push("Untextured by design — this build has no paint stage. Materials are a job for Blender or Godot.");
+  $("notes").innerHTML = bits.join("<br>");
+}
+function setRunning(on) {
+  $("run").classList.toggle("active", on);
+  $("go").disabled = on || !state.file;
+  $("cancel").hidden = !on;
+}
+async function poll(id, t0) {
+  const j = await (await fetch("/api/job/" + id)).json();
+  $("fill").style.width = Math.max(2, j.pct) + "%";
+  $("runmsg").textContent = j.message;
+  const el = Math.round((Date.now() - t0) / 1000);
+  $("runtime").textContent = Math.floor(el / 60) + ":" + String(el % 60).padStart(2, "0");
+  if (j.state === "running") { setTimeout(() => poll(id, t0), 1000); return; }
+  setRunning(false);
+  if (j.state === "done") {
+    showResult(j.result);
+    loadGLB(j.result.glb_url);
+    loadGallery();
+  } else if (j.state === "error") {
+    $("notes").innerHTML = '<span class="err">' + j.error + "</span>";
+  }
+}
+$("go").addEventListener("click", async () => {
+  if (!state.file) return;
+  const fd = new FormData();
+  fd.append("image", state.file, state.file.name);
+  for (const k of ["steps", "octree", "max_faces", "seed", "model"]) {
+    if ($(k).value) fd.append(k, $(k).value);
+  }
+  setRunning(true);
+  $("fill").style.width = "2%"; $("runmsg").textContent = "starting"; $("notes").textContent = "";
+  const r = await (await fetch("/api/generate", { method: "POST", body: fd })).json();
+  if (r.error) { setRunning(false); $("notes").innerHTML = '<span class="err">' + r.error + "</span>"; return; }
+  state.job = r.job;
+  poll(r.job, Date.now());
+});
+$("cancel").addEventListener("click", async () => {
+  if (state.job) await fetch("/api/job/" + state.job + "/cancel", { method: "POST" });
+});
+
+/* ---------- stl ---------- */
+$("stl").addEventListener("click", async () => {
+  if (!state.glb) return;
+  $("stl").disabled = true; $("stlnotes").textContent = "slicing check running…";
+  const r = await (await fetch("/api/stl", {
+    method: "POST", headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ glb: state.glb, height_mm: +$("height").value, min_wall_mm: +$("wall").value }),
+  })).json();
+  $("stl").disabled = false;
+  if (r.error) { $("stlnotes").innerHTML = '<span class="err">' + r.error + "</span>"; return; }
+  $("stlout").innerHTML =
+    '<span class="chip">' + r.size_mm.join(" × ") + " mm</span>" +
+    '<span class="chip">' + r.volume_cm3 + " cm³</span>" +
+    '<span class="chip' + (r.bbox_fill_pct < 8 ? " fail" : "") + '">' + r.bbox_fill_pct + "% of bbox</span>" +
+    Object.entries(r.checks).map(([k, v]) =>
+      '<span class="chip ' + (v ? "pass" : "fail") + '">' + k + (v ? " ✓" : " ✗") + "</span>").join("");
+  $("stlnotes").innerHTML = (r.warnings || []).length
+    ? '<span class="warn">' + r.warnings.join("<br>") + "</span>"
+    : "Passed every check. bbox fill is the number renders cannot show — a thin hollow shell and a solid look identical until you slice them.";
+  $("stldl").hidden = false; $("stldl").href = r.stl_url;
+});
+
+/* ---------- gallery + status ---------- */
+async function loadGallery() {
+  const g = await (await fetch("/api/gallery")).json();
+  if (!g.items.length) { $("gallery").innerHTML = '<p class="notes">nothing generated yet</p>'; return; }
+  $("gallery").innerHTML = g.items.map((i) =>
+    '<button data-url="' + i.url + '"><span class="name">' + i.name +
+    '</span><span class="mb">' + i.mb + " MB</span></button>").join("");
+}
+// ?glb=/files/x.glb opens straight into a mesh: a reload keeps what you were
+// looking at, and a link to one is a link someone else can open.
+function openMesh(url, push) {
+  $("stats").innerHTML = ""; $("notes").textContent = "";
+  loadGLB(url);
+  if (push) history.replaceState(null, "", "?glb=" + encodeURIComponent(url));
+}
+$("gallery").addEventListener("click", (e) => {
+  const b = e.target.closest("button[data-url]");
+  if (b) openMesh(b.dataset.url, true);
+});
+(async function status() {
+  try {
+    const s = await (await fetch("/api/status")).json();
+    // server_status is flat: every key whose value is an object with .ok is a
+    // check. Name the failing ones rather than counting them — "weights_cached"
+    // tells the user what to fix, "2 checks failing" sends them to a log.
+    const bad = Object.entries(s).filter(([, v]) => v && v.ok === false).map(([k]) => k);
+    const gpu = s.cuda_ok || {};
+    $("gpu").innerHTML = '<span class="dot ' + (bad.length ? "bad" : "ok") + '"></span>' +
+      (bad.length ? bad.join(", ") + " failing — run setup_engine"
+                  : (gpu.device || "engine ready") +
+                    (gpu.free_gib ? " · " + gpu.free_gib + " GiB free" : ""));
+  } catch (e) { $("gpu").innerHTML = '<span class="dot bad"></span>backend unreachable'; }
+})();
+loadGallery();
+const wanted = new URLSearchParams(location.search).get("glb");
+if (wanted && wanted.startsWith("/files/")) openMesh(wanted, false);
+</script>
+</body>
+</html>

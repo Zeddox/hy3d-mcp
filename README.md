@@ -166,12 +166,37 @@ what a by-the-book install of the upstream repo gets wrong, and what
 | `finish_model` | game-look texture pass — needs a GLB textured elsewhere | seconds |
 | `paint_mesh` | unavailable on this build; refuses with an explanation | — |
 
-Generation is serialized — one job at a time; concurrent calls queue
-rather than thrash the card. `generate_model` streams MCP progress
+Generation is serialized — one job at a time, machine-wide. The queue is an
+`flock`, not just an in-process lock, so a job started from the workbench
+or from a second Claude Code session waits its turn instead of thrashing
+the card: on WSL2 two concurrent jobs do not fail, they both spill into
+host RAM and crawl at PCIe bandwidth. `generate_model` streams MCP progress
 notifications the whole way through (real diffusion steps, not a fake
 clock), so a slow job stays distinguishable from a hung one, and
 cancelling the call kills the engine process rather than leaving it
 holding the queue.
+
+## The workbench
+
+A browser front end over the same tools, for when you would rather point at
+an image than describe one:
+
+    pip install "hy3d-mcp[web]"   # or: uv pip install ...
+    hy3d-web
+    # hy3d workbench  ->  http://localhost:8760
+
+Drop or paste a concept image, watch the engine's own progress, orbit the
+result in three.js, and export an STL with the printability checks attached.
+Anything already generated is in the Outputs list, and `?glb=/files/<name>.glb`
+opens straight into a mesh — a reload keeps what you were looking at.
+
+It is a separate process from the MCP server and shares nothing with it but
+the code and the GPU queue, so running both at once is safe. It binds
+127.0.0.1: WSL2 normally forwards localhost, so `http://localhost:8760` in
+the Windows browser reaches it. When the distro's networking mode does not,
+re-run with `--host 0.0.0.0` and use the address the startup banner prints
+— but note that binding wide exposes a service that runs generation and
+serves files.
 
 ## What a run actually costs
 

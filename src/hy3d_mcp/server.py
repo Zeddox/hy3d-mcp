@@ -16,6 +16,8 @@ Config (env, with defaults):
   HY3D_OUT   default output directory      (~/hy3d-output)
 """
 import asyncio
+import contextlib
+import fcntl
 import json
 import os
 import re
@@ -105,9 +107,59 @@ _job_lock = asyncio.Lock()
 _queue_depth = 0
 _queue_guard = threading.Lock()
 _last_job: dict | None = None
+# _job_lock only binds this process. The workbench (hy3d_mcp.web) is a second
+# one, and so is a second Claude Code session, so the queue has to be
+# machine-wide or it is not a queue. flock rather than a pidfile because the
+# kernel drops it when the holder dies: a crashed engine must not wedge the
+# GPU behind a stale file.
+JOB_LOCK_PATH = Path(os.environ.get(
+    "HY3D_JOB_LOCK", "~/.hy3d/job.lock")).expanduser()
 # The engine child currently running, so cancel_job can reach it without a pid
 # hunt. Only one exists at a time — _job_lock sees to that.
 _current_proc: asyncio.subprocess.Process | None = None
+
+
+@contextlib.asynccontextmanager
+async def _machine_job_lock(ctx: "Context | None" = None):
+    """Hold the machine-wide generation lock for the duration of the block.
+
+    Waits rather than errors, matching what awaiting _job_lock already does
+    to a second caller in this process. The wait is polled in 1s steps
+    instead of a blocking flock(2) call, because a blocking syscall on the
+    event loop would freeze the heartbeat, every other tool call, and — in
+    the web process — the HTTP server itself.
+
+    While waiting it reports progress under 1%, so a client whose job is
+    queued behind another process sees a queue rather than an idle
+    connection it eventually gives up on.
+    """
+    JOB_LOCK_PATH.parent.mkdir(parents=True, exist_ok=True)
+    fd = os.open(JOB_LOCK_PATH, os.O_RDWR | os.O_CREAT, 0o644)
+    waited = 0.0
+    try:
+        while True:
+            try:
+                fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                break
+            except BlockingIOError:
+                if ctx is not None and waited % HEARTBEAT_SECONDS == 0.0:
+                    with contextlib.suppress(Exception):
+                        await ctx.report_progress(
+                            min(waited / 600.0, 0.9), 100.0,
+                            "waiting for the GPU — another hy3d process is "
+                            "generating (%s)" % _mmss(waited))
+                await asyncio.sleep(1.0)
+                waited += 1.0
+        # Diagnostic only; the lock is the flock, never this text.
+        os.ftruncate(fd, 0)
+        os.write(fd, b"%d %s\n" % (os.getpid(),
+                    time.strftime("%Y-%m-%dT%H:%M:%S").encode()))
+        yield
+    finally:
+        try:
+            fcntl.flock(fd, fcntl.LOCK_UN)
+        finally:
+            os.close(fd)
 
 
 def _record_job(tool: str, target: str, ok: bool, seconds: float) -> None:
@@ -313,7 +365,10 @@ async def generate_model(
     max_faces decimates the raw output (typically 600k–1M faces, which is
     not something to hand an engine) down to a game-ready budget; 0 keeps
     the raw mesh. Decimation preserves watertightness.
-    Blocks while an earlier generation is running (single-job queue).
+    Blocks while an earlier generation is running. The queue is machine-wide,
+    not per-process: a job started from the workbench or from another Claude
+    Code session holds it too, because two concurrent jobs on WSL2 do not
+    fail — they spill into host RAM and both crawl.
 
     Quality knobs. Each defaults to None, which lets the driver's own
     default (in parens) apply.
@@ -370,7 +425,11 @@ async def generate_model(
     with _queue_guard:
         _queue_depth += 1
     try:
-        async with _job_lock:
+        # Two locks, one queue: _job_lock orders callers inside this process,
+        # the flock orders this process against every other hy3d process on
+        # the machine. Both are needed — on WSL2 a second concurrent job does
+        # not fail, it spills into host RAM and both crawl.
+        async with _job_lock, _machine_job_lock(ctx):
             gen_input = src
             if auto_cutout and not _has_real_alpha(src):
                 rgba = HY3D_OUT / "intermediate" / (src.stem + "-rgba.png")

@@ -1,19 +1,30 @@
 [project]
 name = "hy3d-mcp"
-version = "0.7.1"
-description = "MCP server wrapping the local Hunyuan3D-MLX image-to-3D pipeline: concept image in, textured GLB out"
+version = "0.8.0"
+description = "MCP server and local workbench for Hunyuan3D-2 image-to-3D on CUDA: concept image in, game-ready GLB out"
 readme = "README.md"
 requires-python = ">=3.12"
 license = { text = "MIT" }
 authors = [{ name = "Jim Cline" }]
-keywords = ["mcp", "3d", "hunyuan3d", "mlx", "image-to-3d"]
+keywords = ["mcp", "3d", "hunyuan3d", "cuda", "image-to-3d"]
 dependencies = [
     "fastmcp>=2.0",
     "pillow>=10.0",
 ]
 
+# The workbench serves HTTP; the MCP server does not. Declared rather than
+# leaned on: fastmcp already pulls all three in for its own HTTP transports,
+# which is exactly the kind of dependency that disappears in a minor release.
+[project.optional-dependencies]
+web = [
+    "starlette>=0.37",
+    "uvicorn>=0.30",
+    "python-multipart>=0.0.9",
+]
+
 [project.scripts]
 hy3d-mcp = "hy3d_mcp.server:main"
+hy3d-web = "hy3d_mcp.web:main"
 
 [build-system]
 requires = ["hatchling"]

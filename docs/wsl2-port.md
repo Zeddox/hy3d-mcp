@@ -420,3 +420,44 @@ The installer does not use sudo. The two system libraries need root and
 nothing else in the install does, so preflight reports the exact
 `sudo apt install libopengl0 libegl1` line and phase 6 proves whether they
 are actually working.
+
+## Phase 5: the workbench, and what verifying it took
+
+The plan is in [`workbench-2026-09-06.md`](workbench-2026-09-06.md). It held:
+a standalone starlette process that imports `server.py` and calls the tool
+functions directly, a duck-typed `ctx` for progress, polling rather than SSE,
+and an `flock` to make the single-job queue machine-wide. Three things are
+worth recording beyond that.
+
+**The progress sink works, and it was the one part that could have failed
+silently.** `_run_engine` awaits `ctx.report_progress` inside a bare
+`except Exception: pass`, so a non-coroutine would have been swallowed with
+nothing anywhere to say why. Proved with a real job through the HTTP API:
+
+    0.0s    0.0%  queued
+    7.0s    2.0%  shape: loading tencent/Hunyuan3D-2
+    35.2s  11.6%  shape: loaded in 28s, 5.95 GiB resident
+    41.2s  40.0%  shape: decoding volume at octree 384
+    112.7s 53.6%  shape — 1m45s elapsed
+    123.7s 95.0%  shape: decimating 645808 -> 20000 faces
+    136.7s 100.0% done
+
+That is the MCP path's own progress, verbatim, arriving in a browser.
+
+**The flock was proved against a live holder, not by reading it.** A second
+interpreter took the lock; the workbench waited, reported the wait under 1%
+so a queued client sees a queue rather than an idle connection; a third
+process was refused; and killing the holder released it in the same second —
+which is the property that made `flock` the right choice over a pidfile.
+
+**Uploads are the reason `_out_path` needed help.** It names the GLB after the
+input stem, which is fine when an agent picks the names and a bug the moment
+there is an upload button: two files called `image.png` would overwrite each
+other's mesh while the gallery listed the stale one. Uploads now get a
+timestamped stem, and the saved name is derived rather than trusted — a test
+upload named `../../etc/pass wd.webp` landed as `pass-wd-20260906-135439.webp`.
+
+One thing the plan did not have: `?glb=/files/<name>.glb`. It exists because a
+reload should keep the mesh you were looking at, and it is also what made the
+viewer verifiable without a browser — headless Chrome with software WebGL,
+pointed at that URL, renders the lantern.
