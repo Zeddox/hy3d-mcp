@@ -22,9 +22,12 @@ faces, the multiview viking) with its own front view as the prompt image.
 0.20 GiB is not comfortable. Under WSL2 an over-budget job does not raise
 OOM, it spills into host RAM and crawls at PCIe bandwidth, so the failure
 mode of pushing this further is a run that takes an hour rather than one that
-stops. **1024 is the ceiling on this card**, not a conservative starting
-point: upstream's default is 2048, which is 4x the buffer area across six
-camera views and will not fit.
+stops. **1024 is the ceiling on this card at 40,000 faces**, not a
+conservative starting point: upstream's default is 2048, which is 4x the
+buffer area across six camera views and will not fit. The face count is part
+of that claim rather than incidental -- `back_project` rasterises real
+geometry per view, so a mesh generated with a higher `max_faces` moves the
+number and has not been measured.
 
 Both sub-pipelines need `enable_model_cpu_offload()`. That is not a tuning
 knob here — the two of them are ~7.4 GiB of fp16 weights, more than the card
