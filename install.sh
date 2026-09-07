@@ -16,6 +16,7 @@
 #   ./install.sh --plan       print what would happen and exit
 #   ./install.sh --yes        run unattended (for CI or the setup_engine tool)
 #   ./install.sh --only 3     run a single phase
+#   ./install.sh --with-mv    also fetch the multiview checkpoint (+4.6GB)
 #
 # Phase numbers are a public contract — setup_engine(only=N) passes them
 # straight through — so they do not get renumbered.
@@ -38,6 +39,10 @@ ENGINE_REF="${HY3D_ENGINE_REF:-f8db63096c8282cb27354314d896feba5ba6ff8a}"
 # one subfolder rather than snapshotting the repo.
 SHAPE_HF="tencent/Hunyuan3D-2"
 SHAPE_SUB="hunyuan3d-dit-v2-0"
+# The multiview checkpoint, fetched only on request: it is another 4.6GB and
+# it buys nothing for the single-image workflow, which is what most runs are.
+MV_HF="tencent/Hunyuan3D-2mv"
+MV_SUB="hunyuan3d-dit-v2-mv"
 # Upstream resolves weights from $HY3DGEN_MODELS (default ~/.cache/hy3dgen)
 # before it ever asks HuggingFace — see hy3dgen/shapegen/utils.py — so
 # fetching into that tree is what makes the first run offline-clean.
@@ -81,6 +86,7 @@ CORE_IMPORT="import torch, numpy, cv2, PIL, scipy, trimesh, pygltflib, skimage, 
 APT_LIBS=(libopengl0 libegl1)
 
 MODE=run          # run | plan
+WITH_MV=0         # fetch the multiview checkpoint too
 ASSUME_YES=0
 ONLY=""
 
@@ -108,6 +114,7 @@ while [ $# -gt 0 ]; do
         --plan)   MODE=plan ;;
         --yes|-y) ASSUME_YES=1 ;;
         --only)   ONLY="${2:-}"; shift ;;
+        --with-mv) WITH_MV=1 ;;
         --repo)   ENGINE_REPO="${2:-}"; shift ;;
         --venv)   ENGINE_VENV="${2:-}"; shift ;;
         -h|--help) usage ;;
@@ -294,23 +301,51 @@ render, but a textured GLB from elsewhere will not. Retry with: $UV pip \
 install --python $PY --upgrade '$GL_MIN'"
 }
 
+# Named files, not a subfolder glob: every one of these repos ships the same
+# checkpoint twice, once as .safetensors and once as .ckpt, and a `sub/*`
+# pattern quietly downloads both -- 4.6GB spent on a copy nothing loads.
+# local_dir into ~/.cache/hy3dgen, because that is the tree upstream consults
+# before it ever contacts HuggingFace, so a run never re-resolves the repo
+# over the network.
+fetch_ckpt() {
+    "$PY" - "$1" "$2" "$3" <<'PY' || { bad "weight download failed"; return 1; }
+import sys
+from huggingface_hub import snapshot_download
+repo, sub, dest = sys.argv[1:4]
+snapshot_download(repo_id=repo, local_dir=dest, allow_patterns=[
+    "%s/config.yaml" % sub, "%s/model.fp16.safetensors" % sub])
+PY
+}
+
 # ---------------------------------------------------------------- phase 5
 download_weights() {
     phase 5 "model weights — $MODELS_DIR/$SHAPE_HF/$SHAPE_SUB"
     local dest="$MODELS_DIR/$SHAPE_HF"
     local ckpt="$dest/$SHAPE_SUB/model.fp16.safetensors"
     local u2net="$HOME/.u2net/u2net.onnx"
+    local mv_dest="$MODELS_DIR/$MV_HF"
+    local mv_ckpt="$mv_dest/$MV_SUB/model.fp16.safetensors"
 
-    local need_shape=1 need_u2net=1
+    local need_shape=1 need_u2net=1 need_mv=0
     [ -f "$ckpt" ] && need_shape=0
     [ -f "$u2net" ] && need_u2net=0
+    [ "$WITH_MV" = 1 ] && [ ! -f "$mv_ckpt" ] && need_mv=1
 
     [ "$need_shape" = 0 ] && skip "shape weights present ($(du -sh "$dest/$SHAPE_SUB" 2>/dev/null | cut -f1))"
     [ "$need_u2net" = 0 ] && skip "u2net present ($(du -h "$u2net" 2>/dev/null | cut -f1))"
-    [ "$need_shape" = 0 ] && [ "$need_u2net" = 0 ] && return 0
+    # Reported either way. Which models are on disk decides which workflows
+    # the workbench can offer, so "you do not have this one" is as much a
+    # status line as "you do".
+    if [ -f "$mv_ckpt" ]; then
+        skip "multiview weights present ($(du -sh "$mv_dest/$MV_SUB" 2>/dev/null | cut -f1))"
+    elif [ "$WITH_MV" = 0 ]; then
+        skip "multiview weights absent — pass --with-mv to fetch them (+4.6GB)"
+    fi
+    [ "$need_shape" = 0 ] && [ "$need_u2net" = 0 ] && [ "$need_mv" = 0 ] && return 0
 
     if [ "$MODE" = plan ]; then
         [ "$need_shape" = 1 ] && work "download $SHAPE_HF/$SHAPE_SUB (~4.6GB)"
+        [ "$need_mv" = 1 ] && work "download $MV_HF/$MV_SUB (~4.6GB)"
         [ "$need_u2net" = 1 ] && work "download u2net for rembg (~176MB)"
         return 0
     fi
@@ -319,17 +354,16 @@ download_weights() {
     if [ "$need_shape" = 1 ]; then
         confirm "download ~4.6GB of shape weights from HuggingFace" || return 0
         work "downloading $SHAPE_HF/$SHAPE_SUB (this is the slow one)"
-        # allow_patterns, not a bare snapshot: the same repo carries the paint
-        # stage. And local_dir into ~/.cache/hy3dgen, because that is the tree
-        # upstream consults before it ever contacts HuggingFace, so a run here
-        # never re-resolves the repo over the network.
-        "$PY" - "$SHAPE_HF" "$SHAPE_SUB" "$dest" <<'PY' || { bad "weight download failed"; return 1; }
-import sys
-from huggingface_hub import snapshot_download
-repo, sub, dest = sys.argv[1:4]
-snapshot_download(repo_id=repo, allow_patterns=["%s/*" % sub], local_dir=dest)
-PY
+        fetch_ckpt "$SHAPE_HF" "$SHAPE_SUB" "$dest" || return 1
         [ -f "$ckpt" ] && ok "shape weights in place" || { bad "download finished but $ckpt is missing"; return 1; }
+    fi
+
+    if [ "$need_mv" = 1 ]; then
+        confirm "download ~4.6GB of multiview weights from HuggingFace" || return 0
+        work "downloading $MV_HF/$MV_SUB"
+        fetch_ckpt "$MV_HF" "$MV_SUB" "$mv_dest" || return 1
+        [ -f "$mv_ckpt" ] && ok "multiview weights in place" \
+            || { bad "download finished but $mv_ckpt is missing"; return 1; }
     fi
 
     if [ "$need_u2net" = 1 ]; then

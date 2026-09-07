@@ -157,6 +157,7 @@ what a by-the-book install of the upstream repo gets wrong, and what
 | Tool | What it does | Typical time |
 | --- | --- | --- |
 | `generate_model` | image → watertight GLB (auto cutout, decimation) | ~3 min |
+| `generate_model` w/ views | front + left/back/right → GLB via Hunyuan3D-2mv | ~4 min |
 | `export_stl` | GLB → print-ready STL, Z-up, scaled to a target height | seconds |
 | `prepare_concept` | concept image → centered square RGBA cutout | seconds |
 | `render_preview` | offscreen PNG renders from any angle | seconds |
@@ -175,6 +176,48 @@ notifications the whole way through (real diffusion steps, not a fake
 clock), so a slow job stays distinguishable from a hung one, and
 cancelling the call kills the engine process rather than leaving it
 holding the queue.
+
+## Multiview
+
+A single image cannot tell the model what the back looks like, so the shape
+stage infers one, and what it infers is a smooth mirror of the front. Passing
+the real back stops it guessing. `generate_model` takes `left_image`,
+`back_image` and `right_image` alongside `image_path`, and any one of them
+switches the run to `tencent/Hunyuan3D-2mv` — a separate 4.6GB checkpoint
+whose conditioner reads all four views at once. Fetch it with
+`./hy3d install --only 5 --with-mv`; without it the single-image workflow is
+unaffected and `server_status` reports `mv_weights_cached` as the one soft
+failure.
+
+The views have to agree with each other. They must be the same subject at the
+same scale from those four angles — front, then 90° clockwise for left, 180°
+for back, 270° for right. A turntable render or an orthographic sheet works;
+four separately-prompted images usually do not, and views that disagree about
+proportion give a worse mesh than the front alone. There is no slot for a
+three-quarter or perspective view: the conditioner knows those four indices
+and nothing else. A subset is fine — front plus back is a real improvement on
+its own.
+
+Measured on the 3060 Ti, upstream's `example_mv_images/1`, seed 42, 50 steps,
+octree 384, both inputs pre-keyed so background removal was not a variable:
+
+| | one image | front + left + back |
+| --- | --- | --- |
+| generate | 114.9s | 152.6s |
+| peak VRAM | 6.22 GiB | 6.69 GiB of 6.96 |
+| raw faces | 616,244 | 636,980 |
+
+Multiview costs about a third more time and 0.47 GiB more VRAM, which on an
+8GB card leaves under 0.3 GiB of headroom at octree 384. A fourth view or a
+higher octree is where that runs out — drop to octree 320 or pass
+`cpu_offload=True`, and check `peak_reserved_gib` in the result, because on
+WSL2 the failure mode is not an OOM but a silent spill to host RAM.
+
+What the extra views actually bought on that test: both overall straps
+instead of one lumpy asymmetric one, bows with a knot rather than blocks, a
+hairline where the single-image mesh had a smooth ball, and fingers instead
+of mittens. The subject was near-symmetric, which understates it — a
+backpack, cape or tail is where a single front view has nothing to go on.
 
 ## The workbench
 
@@ -198,6 +241,7 @@ a page whose only working button would be the gallery), and hands over with
     ./hy3d stop             stop a backgrounded one
     ./hy3d status           run the checks and exit
     ./hy3d install          hand off to install.sh (engine venv, weights)
+    ./hy3d install --with-mv  the above plus the multiview checkpoint
 
 Engine setup stays in `install.sh`, which `./hy3d` names but never runs
 uninvited — phase 5 downloads 4.6GB and asks first. From a wheel rather than
@@ -205,6 +249,9 @@ a checkout, `pip install "hy3d-mcp[web]"` and `hy3d-web` are the equivalent.
 
 Drop or paste a concept image, watch the engine's own progress, orbit the
 result in three.js, and export an STL with the printability checks attached.
+The **Multiview** toggle opens three more slots — left, back, right — and
+switches the run to the checkpoint that reads them; it greys itself out with
+the fix when that checkpoint is not downloaded.
 Anything already generated is in the Outputs list, and `?glb=/files/<name>.glb`
 opens straight into a mesh — a reload keeps what you were looking at.
 

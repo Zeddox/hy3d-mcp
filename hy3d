@@ -211,7 +211,20 @@ cmd_stop() {
     # Verify before killing: a pidfile outlives its process, and the number in
     # it may since have been reused by something else entirely.
     if [ -r "/proc/$pid/cmdline" ] && tr '\0' ' ' < "/proc/$pid/cmdline" | grep -q "hy3d"; then
-        kill "$pid" && ok "stopped pid $pid"
+        kill "$pid"
+        # Wait for it to actually go. `kill` returns when the signal is
+        # delivered, not when the process has exited and released the port, so
+        # `./hy3d stop && ./hy3d web` used to find the old server still
+        # listening and report it as already running.
+        local waited=0
+        while [ -d "/proc/$pid" ] && [ "$waited" -lt 100 ]; do
+            sleep 0.1; waited=$((waited + 1))
+        done
+        if [ -d "/proc/$pid" ]; then
+            warn "pid $pid ignored SIGTERM for 10s — sending SIGKILL"
+            kill -9 "$pid" 2>/dev/null
+        fi
+        ok "stopped pid $pid"
         rm -f "$PIDFILE"
     else
         warn "pid $pid is not a workbench (already stopped?) — removing the stale pidfile"

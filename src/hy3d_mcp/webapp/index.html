@@ -98,6 +98,26 @@
   }
   .drop .hint b { color: var(--ink); font-weight: 600; }
   .drop input { display: none; }
+  .drop .tag {
+    position: absolute; left: 8px; bottom: 8px; z-index: 1;
+    font-size: 10px; letter-spacing: .09em; text-transform: uppercase;
+    background: var(--sunken); color: var(--muted);
+    padding: 3px 8px; border-radius: 999px; display: none;
+  }
+
+  /* Four slots and one grid, not two layouts: single mode is this same grid
+     with the optional three collapsed, so switching workflow never asks you
+     to pick a front view you already picked. */
+  .views { display: grid; gap: 8px; }
+  .views .opt { display: none; }
+  .views.mv { grid-template-columns: 1fr 1fr; }
+  .views.mv .opt { display: grid; }
+  /* The tag only earns its place once the picture hides the slot's own
+     label -- before that the empty hint already says which view this is. */
+  .views.mv .drop.filled .tag { display: block; }
+
+  .rail .seg { width: 100%; margin-bottom: 10px; }
+  .rail .seg button { flex: 1; padding: 7px 10px; font-size: 12.5px; }
 
   .fields { display: grid; grid-template-columns: 1fr 1fr; gap: 10px; }
   .field { display: flex; flex-direction: column; gap: 4px; }
@@ -166,10 +186,10 @@
   .stage .empty { color: var(--muted); font-size: 14px; padding: 24px; text-align: center; max-width: 42ch; }
 
   .toolbar { display: flex; gap: 8px; flex-wrap: wrap; align-items: center; }
-  .toolbar .seg { display: flex; border: 1px solid var(--line); border-radius: 8px; overflow: hidden; }
-  .toolbar .seg button { border: none; border-radius: 0; padding: 8px 13px; font-size: 13px; font-weight: 500; }
-  .toolbar .seg button + button { border-left: 1px solid var(--line); }
-  .toolbar .seg button[aria-pressed="true"] { background: var(--accent); color: var(--accent-in); }
+  .seg { display: flex; border: 1px solid var(--line); border-radius: 8px; overflow: hidden; }
+  .seg button { border: none; border-radius: 0; padding: 8px 13px; font-size: 13px; font-weight: 500; }
+  .seg button + button { border-left: 1px solid var(--line); }
+  .seg button[aria-pressed="true"] { background: var(--accent); color: var(--accent-in); }
   .toolbar .spacer { margin-left: auto; }
 
   .stats { display: grid; grid-template-columns: repeat(auto-fit, minmax(118px, 1fr)); gap: 1px;
@@ -219,13 +239,39 @@
   <aside class="rail">
     <section class="card">
       <h2>Concept</h2>
-      <label class="drop" id="drop">
-        <input type="file" id="file" accept="image/png,image/jpeg,image/webp,image/bmp">
-        <span class="hint" id="hint"><b>Drop an image</b><br>or click to pick · Ctrl+V pastes</span>
-      </label>
-      <p class="notes" style="margin:10px 0 0">One object, plain background, no drop
-        shadow. The background gets keyed out and the subject cropped square before
-        it reaches the generator.</p>
+      <div class="seg" id="workflow">
+        <button data-mode="single" aria-pressed="true">One image</button>
+        <button data-mode="mv" aria-pressed="false">Multiview</button>
+      </div>
+      <div class="views" id="views">
+        <label class="drop" id="drop-front">
+          <input type="file" accept="image/png,image/jpeg,image/webp,image/bmp">
+          <span class="hint"><b>Drop an image</b><br>or click to pick · Ctrl+V pastes</span>
+          <span class="tag">front</span>
+        </label>
+        <label class="drop opt" id="drop-left">
+          <input type="file" accept="image/png,image/jpeg,image/webp,image/bmp">
+          <span class="hint">left</span>
+          <span class="tag">left</span>
+        </label>
+        <label class="drop opt" id="drop-back">
+          <input type="file" accept="image/png,image/jpeg,image/webp,image/bmp">
+          <span class="hint">back</span>
+          <span class="tag">back</span>
+        </label>
+        <label class="drop opt" id="drop-right">
+          <input type="file" accept="image/png,image/jpeg,image/webp,image/bmp">
+          <span class="hint">right</span>
+          <span class="tag">right</span>
+        </label>
+      </div>
+      <p class="notes" id="singlenote" style="margin:10px 0 0">One object, plain
+        background, no drop shadow. The background gets keyed out and the subject
+        cropped square before it reaches the generator.</p>
+      <p class="notes" id="mvnote" hidden style="margin:10px 0 0">Front is required;
+        the back view is the one that pays. Same subject, same scale, turned
+        90° at a time — a turntable render or an orthographic sheet. Views that
+        disagree about proportion give a worse mesh than the front alone.</p>
       <details class="adv">
         <summary>Settings</summary>
         <div class="fields">
@@ -237,7 +283,7 @@
             <input id="max_faces" type="number" min="0" step="1000" value="40000"></div>
           <div class="field"><label for="seed">seed</label>
             <input id="seed" type="number" value="42"></div>
-          <div class="field wide"><label for="model">model</label>
+          <div class="field wide"><label for="model" id="modellabel">model</label>
             <select id="model">
               <option value="">Hunyuan3D-2 (3.3B, solid)</option>
               <option value="tencent/Hunyuan3D-2mini">2mini (2× faster, can come back hollow)</option>
@@ -381,26 +427,71 @@ $("reset").addEventListener("click", () => {
 });
 
 /* ---------- picking ---------- */
-const drop = $("drop"), fileInput = $("file");
-function takeFile(f) {
-  if (!f || !f.type.startsWith("image/")) return;
-  state.file = f;
-  const img = drop.querySelector("img") || Object.assign(document.createElement("img"), { alt: "" });
-  img.src = URL.createObjectURL(f);
-  if (!img.parentNode) drop.appendChild(img);
-  $("hint").hidden = true;
-  $("go").disabled = false;
+// front first: it is the required one, and the order is also the order the
+// paste target walks and the order the mv conditioner expects.
+const VIEWS = ["front", "left", "back", "right"];
+const EXTRA = VIEWS.slice(1);
+state.files = {};
+const slotOf = (tag) => $("drop-" + tag);
+
+function refreshGo() {
+  // Multiview with nothing but a front view is not a multiview run, it is a
+  // single-image run against a checkpoint chosen for a job it is not being
+  // given. Say so on the button rather than quietly generating the lesser
+  // thing.
+  const bare = state.mv && !EXTRA.some((t) => state.files[t]);
+  $("go").disabled = !state.files.front || bare;
+  $("go").textContent = bare && state.files.front
+    ? "Add a second view" : "Generate";
 }
-fileInput.addEventListener("change", () => takeFile(fileInput.files[0]));
-["dragenter", "dragover"].forEach((t) => drop.addEventListener(t, (e) => {
-  e.preventDefault(); drop.classList.add("over");
-}));
-["dragleave", "drop"].forEach((t) => drop.addEventListener(t, (e) => {
-  e.preventDefault(); drop.classList.remove("over");
-}));
-drop.addEventListener("drop", (e) => takeFile(e.dataTransfer.files[0]));
+
+function wireSlot(tag) {
+  const el = slotOf(tag), input = el.querySelector("input");
+  el.take = (f) => {
+    if (!f || !f.type.startsWith("image/")) return;
+    state.files[tag] = f;
+    let img = el.querySelector("img");
+    if (!img) { img = document.createElement("img"); img.alt = ""; el.appendChild(img); }
+    img.src = URL.createObjectURL(f);
+    el.classList.add("filled");
+    el.querySelector(".hint").hidden = true;
+    refreshGo();
+  };
+  input.addEventListener("change", () => el.take(input.files[0]));
+  ["dragenter", "dragover"].forEach((t) => el.addEventListener(t, (e) => {
+    e.preventDefault(); el.classList.add("over");
+  }));
+  ["dragleave", "drop"].forEach((t) => el.addEventListener(t, (e) => {
+    e.preventDefault(); el.classList.remove("over");
+  }));
+  el.addEventListener("drop", (e) => el.take(e.dataTransfer.files[0]));
+}
+VIEWS.forEach(wireSlot);
+
 addEventListener("paste", (e) => {
-  for (const item of e.clipboardData.files) { takeFile(item); break; }
+  // Paste fills the first empty slot, so four pastes fill a multiview set in
+  // view order instead of overwriting the front three times.
+  const shown = state.mv ? VIEWS : ["front"];
+  const tag = shown.find((t) => !state.files[t]) || "front";
+  for (const item of e.clipboardData.files) { slotOf(tag).take(item); break; }
+});
+
+$("workflow").addEventListener("click", (e) => {
+  const btn = e.target.closest("button");
+  if (!btn) return;
+  state.mv = btn.dataset.mode === "mv";
+  for (const b of $("workflow").children) {
+    b.setAttribute("aria-pressed", String(b === btn));
+  }
+  $("views").classList.toggle("mv", state.mv);
+  $("mvnote").hidden = !state.mv;
+  $("singlenote").hidden = state.mv;
+  // The multiview checkpoint is a third model, not a setting on these two:
+  // its conditioner is what reads four views. Leaving the picker live would
+  // offer a choice the run cannot honour.
+  $("model").disabled = state.mv;
+  $("modellabel").textContent = state.mv ? "model — Hunyuan3D-2mv" : "model";
+  refreshGo();
 });
 
 /* ---------- running ---------- */
@@ -418,6 +509,7 @@ function showResult(r) {
     stat("peak VRAM", (r.peak_reserved_gib ?? "?") + ' <span class="of">/ ' +
          (r.vram_ceiling_gib ?? "?") + " GiB</span>", spill ? "warn" : ""),
     stat("wall clock", Math.round(r.seconds) + "s"),
+    r.views ? stat("views", r.views.join(" · ")) : "",
   ].join("");
   const bits = [];
   if (r.stages) bits.push('<span class="stage-line">' + r.stages.join("  →  ") + "</span>");
@@ -427,7 +519,8 @@ function showResult(r) {
 }
 function setRunning(on) {
   $("run").classList.toggle("active", on);
-  $("go").disabled = on || !state.file;
+  $("go").disabled = on;
+  if (!on) refreshGo();
   $("cancel").hidden = !on;
 }
 async function poll(id, t0) {
@@ -449,12 +542,15 @@ async function poll(id, t0) {
   }
 }
 $("go").addEventListener("click", async () => {
-  if (!state.file) return;
+  if (!state.files.front) return;
   const fd = new FormData();
-  fd.append("image", state.file, state.file.name);
-  for (const k of ["steps", "octree", "max_faces", "seed", "model"]) {
+  const put = (field, f) => fd.append(field, f, f.name);
+  put("image", state.files.front);
+  if (state.mv) EXTRA.forEach((t) => state.files[t] && put(t, state.files[t]));
+  for (const k of ["steps", "octree", "max_faces", "seed"]) {
     if ($(k).value) fd.append(k, $(k).value);
   }
+  if (!state.mv && $("model").value) fd.append("model", $("model").value);
   setRunning(true);
   $("fill").style.width = "2%"; $("runmsg").textContent = "starting"; $("notes").textContent = "";
   const r = await (await fetch("/api/generate", { method: "POST", body: fd })).json();
@@ -518,7 +614,18 @@ $("gallery").addEventListener("click", (e) => {
     // server_status is flat: every key whose value is an object with .ok is a
     // check. Name the failing ones rather than counting them — "weights_cached"
     // tells the user what to fix, "2 checks failing" sends them to a log.
-    const bad = Object.entries(s).filter(([, v]) => v && v.ok === false).map(([k]) => k);
+    // mv_weights_cached is deliberately not in this list. It is optional by
+    // construction — the single-image workflow is complete without it — so it
+    // greys out one button instead of reporting the engine as broken.
+    const bad = Object.entries(s)
+      .filter(([k, v]) => v && v.ok === false && k !== "mv_weights_cached")
+      .map(([k]) => k);
+    if (s.mv_weights_cached && s.mv_weights_cached.ok === false) {
+      const btn = $("workflow").querySelector('[data-mode="mv"]');
+      btn.disabled = true;
+      btn.title = s.mv_weights_cached.fix || "multiview checkpoint not downloaded";
+      btn.textContent = "Multiview (no weights)";
+    }
     const gpu = s.cuda_ok || {};
     $("gpu").innerHTML = '<span class="dot ' + (bad.length ? "bad" : "ok") + '"></span>' +
       (bad.length ? bad.join(", ") + " failing — run setup_engine"

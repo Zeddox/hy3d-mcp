@@ -41,6 +41,11 @@ UPLOADS = S.HY3D_OUT / "uploads"
 # Concept art, not video. 64MB is already generous for a PNG.
 MAX_UPLOAD = 64 * 1024 * 1024
 IMAGE_SUFFIXES = {".png", ".jpg", ".jpeg", ".webp", ".bmp"}
+# The extra multiview form fields. Front is `image`, so that a multiview
+# request is the single-image request plus fields rather than a different
+# shape; these three are the only other views the mv conditioner has an
+# index for.
+VIEW_FIELDS = ("left", "back", "right")
 # What /files will serve. Everything else under HY3D_OUT stays private even
 # though the path check would allow it.
 SERVE_SUFFIXES = {".glb", ".png", ".jpg", ".jpeg", ".webp", ".stl"}
@@ -93,6 +98,41 @@ def _unique_stem(stem: str) -> str:
     return "%s-%s" % (stem, time.strftime("%Y%m%d-%H%M%S"))
 
 
+class _BadUpload(Exception):
+    """A rejected upload, carrying the status the client should see."""
+
+    def __init__(self, message: str, status: int = 400):
+        super().__init__(message)
+        self.status = status
+
+
+async def _save_upload(form, field: str, stem: str | None) -> tuple[Path, str]:
+    """Persist one uploaded view, or say precisely which one was wrong.
+
+    `stem` is None for the front view, which mints the timestamped name the
+    other views then hang off: the images of one multiview run belong
+    together on disk, and a per-view timestamp would scatter them across the
+    uploads directory in the order they happened to be read.
+    """
+    upload = form.get(field)
+    if upload is None or not getattr(upload, "filename", ""):
+        raise _BadUpload("no image in the %s field" % field)
+    blob = await upload.read()
+    if len(blob) > MAX_UPLOAD:
+        raise _BadUpload("%s is %.1fMB; the cap is %dMB"
+                         % (field, len(blob) / 1e6,
+                            MAX_UPLOAD // (1024 * 1024)), 413)
+    suffix = Path(upload.filename).suffix.lower()
+    if suffix not in IMAGE_SUFFIXES:
+        raise _BadUpload("unsupported image type %r for %s" % (suffix, field), 415)
+    name = (_unique_stem(_safe_stem(upload.filename)) if stem is None
+            else "%s-%s" % (stem, field))
+    UPLOADS.mkdir(parents=True, exist_ok=True)
+    dst = UPLOADS / (name + suffix)
+    dst.write_bytes(blob)
+    return dst, name
+
+
 def _rel(path: Path) -> str | None:
     """A /files URL for something under HY3D_OUT, or None if it is outside."""
     try:
@@ -117,23 +157,20 @@ async def api_generate(request):
     """Start a job. Either a multipart upload, or a path already on disk."""
     ctype = request.headers.get("content-type", "")
     settings: dict = {}
+    # Front arrives as `image`, the same field a single-image run uses; the
+    # three optional companions arrive under their own names. A run with none
+    # of them is byte-for-byte the request the workbench sent before this
+    # existed, which is what keeps the two workflows one code path.
+    views: dict[str, Path] = {}
     if ctype.startswith("multipart/form-data"):
         form = await request.form()
-        upload = form.get("image")
-        if upload is None or not getattr(upload, "filename", ""):
-            return JSONResponse({"error": "no image in the upload"}, 400)
-        blob = await upload.read()
-        if len(blob) > MAX_UPLOAD:
-            return JSONResponse(
-                {"error": "image is %.1fMB; the cap is %dMB"
-                          % (len(blob) / 1e6, MAX_UPLOAD // (1024 * 1024))}, 413)
-        suffix = Path(upload.filename).suffix.lower()
-        if suffix not in IMAGE_SUFFIXES:
-            return JSONResponse({"error": "unsupported image type %r" % suffix}, 415)
-        stem = _unique_stem(_safe_stem(upload.filename))
-        UPLOADS.mkdir(parents=True, exist_ok=True)
-        src = UPLOADS / (stem + suffix)
-        src.write_bytes(blob)
+        try:
+            src, stem = await _save_upload(form, "image", None)
+            for tag in VIEW_FIELDS:
+                if getattr(form.get(tag), "filename", ""):
+                    views[tag] = (await _save_upload(form, tag, stem))[0]
+        except _BadUpload as e:
+            return JSONResponse({"error": str(e)}, e.status)
         for key in ("octree", "steps", "max_faces", "seed", "guidance", "model"):
             if form.get(key):
                 settings[key] = form[key]
@@ -144,7 +181,17 @@ async def api_generate(request):
         if not src.is_file():
             return JSONResponse({"error": "no such file: %s" % given}, 400)
         stem = _unique_stem(_safe_stem(src.name))
-        settings = {k: v for k, v in body.items() if k != "path"}
+        for tag in VIEW_FIELDS:
+            given = body.get(tag)
+            if not given:
+                continue
+            path = Path(given).expanduser().resolve()
+            if not path.is_file():
+                return JSONResponse(
+                    {"error": "no such %s view: %s" % (tag, given)}, 400)
+            views[tag] = path
+        settings = {k: v for k, v in body.items()
+                    if k != "path" and k not in VIEW_FIELDS}
 
     kwargs: dict = {}
     try:
@@ -154,6 +201,8 @@ async def api_generate(request):
                 kwargs[key] = cast(settings[key])
         if settings.get("model"):
             kwargs["model"] = str(settings["model"])
+        for tag, path in views.items():
+            kwargs[tag + "_image"] = str(path)
     except (TypeError, ValueError) as e:
         return JSONResponse({"error": "bad setting: %s" % e}, 400)
 

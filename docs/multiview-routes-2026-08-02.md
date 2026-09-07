@@ -1,7 +1,10 @@
 # Multiview image-to-3D: implementation routes
 
 Date: 2026-08-02
-Status: **tabled** — specced for a later decision, no work started.
+Status: **superseded 2026-09-06 — shipped in 0.9.0, by none of these routes.**
+See "Outcome" at the foot of this document; every route below assumed an
+Apple Silicon/MLX engine, and the port to CUDA made the whole question a
+different one.
 Prior art: [`multiview-findings-2026-08-02.md`](multiview-findings-2026-08-02.md),
 which investigated whether multiview is worth pursuing. This document assumes
 we pursue it and specs *how*.
@@ -198,3 +201,56 @@ lands. Slower, and merge timing is not in our control.
 - Local weights today: `shape-small` 3.6 GB (`hunyuan3d-dit-v2-mini`),
   `paint-large` 8.1 GB.
 - Engine repo: `ZimengXiong/Hunyuan3D-MLX` at `~/git/repos/hunyuan3d-mlx`.
+
+
+## Outcome (2026-09-06)
+
+None of routes A, B or C happened, because the premise underneath all three
+went away: the engine moved from MLX to CUDA/PyTorch. Multiview on the ported
+engine is not a port, a fork or a hybrid — it is upstream's own code path,
+already in the repo we already run.
+
+**What it took.** Four arguments on `engine_cli.py`, three parameters on
+`generate_model`, a second workflow in the workbench, and one download. The
+model and its dit subfolder had to move together (a `DITS` table): the old
+default subfolder was `hunyuan3d-dit-v2-0`, which does not exist inside the
+mv repo, and asking for it fails as a missing path several frames from the
+choice that caused it.
+
+**The open questions, answered.**
+
+1. *Does the converter emit view-embedding tensors?* Moot — no conversion.
+   `DinoImageEncoderMV` builds its view embedding from `sincos` at
+   construction time (`conditioner.py:147-152`), so it is not a checkpoint
+   tensor at all.
+2. *Do the DiT and VAE construct unchanged?* Yes. The mv `config.yaml` is the
+   base one with two lines different: `DinoImageEncoderMV` in place of
+   `DinoImageEncoder`, and `MVImageProcessorV2` in place of
+   `ImageProcessorV2`. Same depth 16/32, same `num_latents: 3072`, and the
+   checkpoint is the same size to the byte (4,928,151,562).
+3. *Memory and wall time?* Measured, not guessed: 6.69 GiB peak against a
+   6.96 GiB ceiling and 152.6s, versus 6.22 GiB and 114.9s single-image at
+   identical settings. +33% time, +0.47 GiB. Nothing spilled, but under
+   0.3 GiB of headroom is not much to spend on a fourth view.
+4. *`gradio_client` from the Space?* Moot — Phase 0 was a way to avoid running
+   the model locally, and the model runs locally.
+5. *Variable view count, or fixed slots?* **Fixed named slots, and a subset is
+   accepted.** `MVImageProcessorV2.view2idx` is exactly
+   `{front: 0, left: 1, back: 2, right: 3}`; `__call__` sorts the given views
+   by index and concatenates. Passing three works; passing a fifth view, or a
+   three-quarter one, has nowhere to go.
+6. *ComfyUI wrapper on MPS?* Moot — no ComfyUI, no MPS.
+
+**The API question (item 7 above), decided.** The spec leaned toward a
+separate `generate_multiview` tool "to avoid overloading a parameter that is
+single-image on every other path". It went the other way, as three optional
+flat parameters — `left_image`, `back_image`, `right_image` — because the
+concern does not apply to them: `image_path` keeps its meaning exactly, as
+the front view, and nothing about a single-image call changes. A second tool
+would have duplicated ten shared tuning parameters and the whole
+queue/cutout/decimate body to vary two lines.
+
+**What was not free.** The obvious `allow_patterns=["<subfolder>/*"]` costs
+9.5GB, not 4.6GB: the repo ships the same fp16 weights twice, once as
+`.safetensors` and once as `.ckpt`. `install.sh` now names the two files it
+wants. The same bug was in the original shape download and is fixed with it.

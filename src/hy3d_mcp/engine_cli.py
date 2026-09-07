@@ -37,6 +37,18 @@ GIB = 1024 ** 3
 # octree 384 on a 3060 Ti: ~36s diffusion against ~84s decode.
 P_LOADED, P_DIFFUSION_END, P_DECODE_END = 8.0, 40.0, 95.0
 
+# Which dit subfolder belongs to which repo. The pair has to move together:
+# only one of the three names its subfolder after itself, and a mismatched
+# pair is not a loud failure -- smart_load_model simply reports a path that
+# does not exist, several frames away from the choice that caused it.
+DITS = {
+    "tencent/Hunyuan3D-2": "hunyuan3d-dit-v2-0",
+    "tencent/Hunyuan3D-2mini": "hunyuan3d-dit-v2-mini",
+    "tencent/Hunyuan3D-2mv": "hunyuan3d-dit-v2-mv",
+}
+DEFAULT_MODEL = "tencent/Hunyuan3D-2"
+MV_MODEL = "tencent/Hunyuan3D-2mv"
+
 
 def emit(pct, message):
     """One progress line in the form the server's parser expects."""
@@ -83,12 +95,19 @@ def glb_attributes(path):
 
 def main():
     ap = argparse.ArgumentParser(description=__doc__)
-    ap.add_argument("image")
+    ap.add_argument("image", help="the front view, and the only required one")
     ap.add_argument("-o", "--output", default="out.glb")
-    ap.add_argument("--model", default="tencent/Hunyuan3D-2",
-                    help="'tencent/Hunyuan3D-2' (3.3B) or 'tencent/Hunyuan3D-2mini'")
+    ap.add_argument("--model", default=None,
+                    help="default: %s, or %s once a second view is given"
+                         % (DEFAULT_MODEL, MV_MODEL))
     ap.add_argument("--subfolder", default=None,
-                    help="default: hunyuan3d-dit-v2-0, or -v2-mini for 2mini")
+                    help="default: whichever dit subfolder DITS pairs with the "
+                         "chosen model")
+    # front is the positional; these are the other three the mv conditioner
+    # knows about, and any one of them switches the run to multiview.
+    for tag in ("left", "back", "right"):
+        ap.add_argument("--view-" + tag, metavar="IMAGE",
+                        help="the %s view (multiview run)" % tag)
     ap.add_argument("--steps", type=int, default=50)
     ap.add_argument("--guidance-scale", type=float, default=5.0)
     ap.add_argument("--octree-resolution", type=int, default=384)
@@ -101,7 +120,9 @@ def main():
                          "~700k faces, which is not a game-ready mesh. Needs "
                          "libopengl0 installed or pymeshlab's io plugins fail.")
     ap.add_argument("--flashvdm", action="store_true",
-                    help="faster VAE decode path; try only after a baseline run")
+                    help="faster VAE decode path; try only after a baseline "
+                         "run. Swaps in a turbo VAE from a subfolder install.sh "
+                         "does not fetch, so the first use downloads it.")
     ap.add_argument("--engine", default=os.environ.get(
         "HY3D_ENGINE_REPO", str(Path.home() / "git/repos/Hunyuan3D-2")))
     args = ap.parse_args()
@@ -120,27 +141,60 @@ def main():
           % (torch.cuda.get_device_name(0), free0 / GIB, total / GIB,
              "  (nvidia-smi used %d MiB)" % smi0 if smi0 is not None else ""))
 
-    # Upstream's minimal_demo converts to RGBA and *then* tests mode == 'RGB',
-    # so its background removal never runs. Test the source image instead, and
-    # treat an all-opaque alpha channel as no alpha.
-    src = Image.open(args.image)
-    has_alpha = src.mode in ("RGBA", "LA") and src.getchannel("A").getextrema()[0] < 255
-    image = src.convert("RGBA")
-    if not has_alpha:
-        emit(1, "removing background")
-        from hy3dgen.rembg import BackgroundRemover
-        image = BackgroundRemover()(image)
-    else:
-        print("[input] alpha present -- skipping background removal")
+    remover = {"it": None}
 
-    subfolder = args.subfolder or (
-        "hunyuan3d-dit-v2-mini" if "mini" in args.model else "hunyuan3d-dit-v2-0")
-    emit(2, "loading %s" % args.model)
+    def load_view(path, tag):
+        """One view, keyed if it needs it.
+
+        Upstream's minimal_demo converts to RGBA and *then* tests mode ==
+        'RGB', so its background removal never runs. Test the source image
+        instead, and treat an all-opaque alpha channel as no alpha. The
+        remover is built once and shared: it loads an onnx session, and four
+        views would otherwise pay for four of them.
+        """
+        src = Image.open(path)
+        has_alpha = (src.mode in ("RGBA", "LA")
+                     and src.getchannel("A").getextrema()[0] < 255)
+        img = src.convert("RGBA")
+        if has_alpha:
+            print("[input] %s: alpha present -- skipping background removal" % tag)
+            return img
+        emit(1, "removing background (%s)" % tag)
+        if remover["it"] is None:
+            from hy3dgen.rembg import BackgroundRemover
+            remover["it"] = BackgroundRemover()
+        return remover["it"](img)
+
+    paths = {"front": args.image}
+    for tag in ("left", "back", "right"):
+        given = getattr(args, "view_" + tag)
+        if given:
+            paths[tag] = given
+    multiview = len(paths) > 1
+    images = {tag: load_view(path, tag) for tag, path in paths.items()}
+    # MVImageProcessorV2 keys on exactly front/left/back/right and sorts by its
+    # own view index, so a subset is fine but a renaming is not. A single-image
+    # run hands over the bare image, because the plain v2 processor takes one.
+    image = images if multiview else images["front"]
+
+    model = args.model or (MV_MODEL if multiview else DEFAULT_MODEL)
+    if multiview and model != MV_MODEL:
+        # Switching under a caller who named a model is worth doing and worth
+        # saying: the other two repos ship a single-image conditioner, so their
+        # only way to honour four views is to ignore three of them.
+        print("[model] %s has no multiview conditioner -- using %s instead"
+              % (model, MV_MODEL))
+        model = MV_MODEL
+    subfolder = args.subfolder or DITS.get(model, "hunyuan3d-dit-v2-0")
+    print("[model] %s / %s%s"
+          % (model, subfolder,
+             "  views: " + ",".join(images) if multiview else ""))
+    emit(2, "loading %s" % model)
     t = time.time()
     # A "missing keys" warning for the VAE encoder is expected and benign:
     # the bundled checkpoint ships a decoder-only VAE and loads strict=False.
     pipe = Hunyuan3DDiTFlowMatchingPipeline.from_pretrained(
-        args.model, subfolder=subfolder, use_safetensors=True, variant="fp16")
+        model, subfolder=subfolder, use_safetensors=True, variant="fp16")
     if args.flashvdm:
         pipe.enable_flashvdm()
     if args.cpu_offload:
@@ -244,6 +298,8 @@ def main():
         "faces": int(len(mesh.faces)),
         "raw_faces": raw_faces,
         "watertight": bool(mesh.is_watertight),
+        "multiview": multiview,
+        "views": list(images),
         "glb_attributes": glb_attributes(out),
         "load_s": round(load_s, 1),
         "generate_s": round(gen_s, 1),
@@ -253,7 +309,7 @@ def main():
         "resident_after_gib": round(resident, 2),
         "free_at_baseline_gib": round(ceiling, 2),
         "nvidia_smi_used_mib": smi1,
-        "settings": {"model": args.model, "steps": args.steps,
+        "settings": {"model": model, "steps": args.steps,
                      "octree_resolution": args.octree_resolution,
                      "guidance_scale": args.guidance_scale, "seed": args.seed,
                      "cpu_offload": args.cpu_offload, "flashvdm": args.flashvdm},

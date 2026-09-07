@@ -334,6 +334,9 @@ def _engine_json(stdout: str) -> dict:
 @mcp.tool
 async def generate_model(
     image_path: str,
+    left_image: str | None = None,
+    back_image: str | None = None,
+    right_image: str | None = None,
     output_path: str | None = None,
     seed: int = 42,
     auto_cutout: bool = True,
@@ -382,6 +385,21 @@ async def generate_model(
       guidance (5.0)    how tightly shape follows the image; higher is more
                         faithful but can over-sharpen.
 
+    Multiview: image_path is the front view, and left_image / back_image /
+    right_image are optional companions. Give any of them and the run
+    switches to tencent/Hunyuan3D-2mv, a checkpoint whose conditioner reads
+    all the views at once instead of inferring the unseen sides. It is the
+    fix for the failure single-image generation cannot avoid — a back it
+    never saw, invented as a smooth mirror of the front.
+
+    The views have to agree. They must be the same subject, at the same
+    scale, from those exact angles: front, then 90 degrees clockwise (left),
+    180 (back), 270 (right). Views that disagree about proportion produce a
+    worse mesh than the front alone, so a rotating turntable render or a
+    proper orthographic sheet works and four separately-prompted images
+    usually do not. There is no slot for a three-quarter or perspective
+    view; the conditioner knows those four indices and nothing else.
+
     model: 'tencent/Hunyuan3D-2' (default, 3.3B) or 'tencent/Hunyuan3D-2mini'.
     2mini is roughly twice as fast and its renders look comparable, but it
     tends to produce a thin hollow shell where the full model produces a
@@ -392,14 +410,29 @@ async def generate_model(
     ceiling, and it costs runtime, so it is off by default.
     """
     global _queue_depth
-    src = Path(image_path).expanduser().resolve()
-    if not src.is_file():
-        raise ValueError("input image not found: %s" % src)
-    try:
-        with Image.open(src) as im:
-            im.verify()
-    except Exception as e:
-        raise ValueError("input is not a readable image: %s (%s)" % (src, e))
+
+    def readable(path, label):
+        p = Path(path).expanduser().resolve()
+        if not p.is_file():
+            raise ValueError("%s image not found: %s" % (label, p))
+        try:
+            with Image.open(p) as im:
+                im.verify()
+        except Exception as e:
+            raise ValueError("%s is not a readable image: %s (%s)"
+                             % (label, p, e))
+        return p
+
+    src = readable(image_path, "input")
+    # Insertion order is the view order the engine prints and the tags the mv
+    # conditioner keys on; it does not have to be dense, but it does have to
+    # use these names.
+    views = {"front": src}
+    for tag, given in (("left", left_image), ("back", back_image),
+                       ("right", right_image)):
+        if given:
+            views[tag] = readable(given, "%s view" % tag)
+    multiview = len(views) > 1
     if paint:
         raise ValueError(
             "this build has no texture stage: Hunyuan3D's paint pipeline "
@@ -414,7 +447,13 @@ async def generate_model(
     if max_faces < 0:
         raise ValueError("max_faces must be >= 0 (0 disables decimation)")
 
-    dst = _out_path(src.stem, ".glb", output_path)
+    # A multiview set is usually a directory of front.png / left.png / back.png,
+    # and naming the result front.glb after one of its inputs is a bad enough
+    # label to be worth the two lines: take the folder's name instead.
+    stem = src.stem
+    if multiview and stem in ("front", "left", "back", "right"):
+        stem = src.parent.name or stem
+    dst = _out_path(stem, ".glb", output_path)
     stages: list[str] = []
     # Bound before the lock: the result dict reads both outside the try, and an
     # engine that writes the GLB but garbles its final line must not take the
@@ -430,19 +469,26 @@ async def generate_model(
         # the machine. Both are needed — on WSL2 a second concurrent job does
         # not fail, it spills into host RAM and both crawl.
         async with _job_lock, _machine_job_lock(ctx):
-            gen_input = src
-            if auto_cutout and not _has_real_alpha(src):
-                rgba = HY3D_OUT / "intermediate" / (src.stem + "-rgba.png")
+            async def keyed(path, tag):
+                """Cut one view out of its background, or say why we could not.
+
+                Every message names the view. A four-view run has four
+                chances to fail, and a bare "cutout failed" would leave the
+                caller to guess which image to fix.
+                """
+                if not auto_cutout or _has_real_alpha(path):
+                    return path
+                where = "%s: " % tag if multiview else ""
+                # The tag is in the filename for multiview because two views
+                # can share a stem across directories, and the second cutout
+                # would otherwise overwrite the first and be handed back for
+                # both.
+                name = ("%s-%s-rgba.png" % (path.stem, tag) if multiview
+                        else path.stem + "-rgba.png")
                 try:
                     cut = await asyncio.to_thread(
-                        _run_worker, "cutout.py", [str(src), str(rgba)])
-                    gen_input = Path(cut["png_path"])
-                    stages.append("cutout (%s, %.1f%% opaque%s)"
-                                  % (cut.get("method", "corner"),
-                                     cut["opaque_pct"],
-                                     ", %d stray island(s) dropped"
-                                     % cut["components_dropped"]
-                                     if cut.get("components_dropped") else ""))
+                        _run_worker, "cutout.py",
+                        [str(path), str(HY3D_OUT / "intermediate" / name)])
                 except RuntimeError as e:
                     # Both of the worker's keys failed, which on a stock setup
                     # means its interpreter cannot reach rembg at all. The
@@ -452,14 +498,29 @@ async def generate_model(
                     # alpha bbox and pads square, so the subject fills the
                     # latent instead of sharing it with empty background.
                     stages.append(
-                        "cutout failed (%s); the engine will key it itself, "
+                        "%scutout failed (%s); the engine will key it itself, "
                         "without the square recrop"
-                        % str(e).split(": ", 1)[-1][:200])
+                        % (where, str(e).split(": ", 1)[-1][:200]))
+                    return path
+                stages.append("%scutout (%s, %.1f%% opaque%s)"
+                              % (where, cut.get("method", "corner"),
+                                 cut["opaque_pct"],
+                                 ", %d stray island(s) dropped"
+                                 % cut["components_dropped"]
+                                 if cut.get("components_dropped") else ""))
+                return Path(cut["png_path"])
+
+            keyed_views = {tag: await keyed(path, tag)
+                           for tag, path in views.items()}
+            gen_input = keyed_views["front"]
 
             cmd = [str(ENGINE_PY), str(ENGINE_CLI), str(gen_input),
                    "-o", str(dst), "--seed", str(seed),
                    "--max-faces", str(max_faces),
                    "--engine", str(ENGINE_REPO)]
+            for tag in ("left", "back", "right"):
+                if tag in keyed_views:
+                    cmd += ["--view-" + tag, str(keyed_views[tag])]
             if model:
                 cmd += ["--model", model]
             if steps is not None:
@@ -486,7 +547,8 @@ async def generate_model(
                            "was unreadable, so counts and memory figures are "
                            "unavailable. The file itself is fine -- run "
                            "render_preview or export_stl to inspect it.")
-            stages.append("shape")
+            stages.append(("shape (multiview: %s)" % ", ".join(keyed_views))
+                          if multiview else "shape")
             if stats.get("raw_faces") and stats.get("faces") \
                     and stats["faces"] < stats["raw_faces"]:
                 stages.append("decimate (%d -> %d)"
@@ -504,6 +566,8 @@ async def generate_model(
            "peak_reserved_gib": stats.get("peak_torch_reserved_gib"),
            "vram_ceiling_gib": stats.get("free_at_baseline_gib"),
            "seconds": round(seconds, 1), "stages": stages,
+           "views": list(views) if multiview else None,
+           "model": (stats.get("settings") or {}).get("model"),
            "textured": False,
            "progress": "streamed" if streamed else "unavailable"}
     if stats.get("warning") or warning:
@@ -831,6 +895,25 @@ def _server_status() -> dict:
     if found is not None:
         weights["path"] = str(found.parent)
 
+    # Soft, not hard: the single-image workflow is complete without this, and
+    # a preflight that fails on a missing optional model would refuse to start
+    # a server that works. It is a status line so the workbench can grey out a
+    # workflow it cannot run instead of failing four minutes into one.
+    mv_found: Path | None = (
+        models / "tencent/Hunyuan3D-2mv/hunyuan3d-dit-v2-mv" / ckpt)
+    if not mv_found.is_file():
+        mv_found = next((p for p in hub.glob(
+            "models--tencent--Hunyuan3D-2mv/snapshots/*/"
+            "hunyuan3d-dit-v2-mv/" + ckpt)), None)
+    mv_weights = _check(
+        mv_found is not None,
+        "no multiview checkpoint under %s — front/left/back/right generation "
+        "needs tencent/Hunyuan3D-2mv, another ~4.6GB. Single-image "
+        "generation does not, and is unaffected. Fetch it with "
+        "`bash install.sh --only 5 --with-mv`" % models)
+    if mv_found is not None:
+        mv_weights["path"] = str(mv_found.parent)
+
     venv_ok = False
     venv_fix = ("worker venv missing: run `bash install.sh`, "
                 "or set HY3D_PY to a python with cv2/numpy/trimesh/PIL/scipy/"
@@ -894,6 +977,7 @@ def _server_status() -> dict:
     return {
         "engine_repo_ok": repo, "engine_venv_ok": _check(engine_ok, engine_fix),
         "cuda_ok": cuda, "driver_ok": driver, "weights_cached": weights,
+        "mv_weights_cached": mv_weights,
         "cutout_weights_cached": cutout_weights,
         "venv_ok": _check(venv_ok, venv_fix),
         "preview_ok": _check(preview_ok, preview_fix),
