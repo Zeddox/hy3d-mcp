@@ -44,6 +44,33 @@ def main():
     # no-op on an untextured mesh and restores watertightness on a painted
     # one. STL drops UVs anyway, so nothing is lost here.
     mesh.merge_vertices(merge_tex=True, merge_norm=True)
+
+    # Then drop the specks. Undecimated output arrives with a tail of tiny
+    # detached islands -- a single-view elf at octree 384 came back as
+    # 669,656 faces plus fifteen components of 376 faces and under -- and
+    # they are the whole reason such a mesh reports not watertight, not a
+    # single body and no enclosed volume while the figure itself is closed
+    # with zero broken faces. That matters because the undecimated mesh is
+    # exactly what a print user is told to reach for.
+    #
+    # This is not the remesh-or-repair pass the skill warns against: nothing
+    # on the surface is touched, and it is the same operation cutout.py's
+    # largest_component already performs upstream on the image. The hazard is
+    # also the same one -- a genuinely two-part subject losing its second
+    # part -- so the threshold is relative and generous (a thousandth of the
+    # largest component, which here would have had to be 670 faces to be
+    # dropped), and whatever goes is reported rather than quietly removed.
+    dropped = []
+    if mesh.body_count > 1:
+        comps = mesh.split(only_watertight=False)
+        sizes = [len(c.faces) for c in comps]
+        floor = max(4, int(0.001 * max(sizes)))
+        keep = [c for c, n in zip(comps, sizes) if n >= floor]
+        dropped = sorted((n for n in sizes if n < floor), reverse=True)
+        if dropped and keep:
+            mesh = trimesh.util.concatenate(keep)
+            mesh.merge_vertices(merge_tex=True, merge_norm=True)
+
     checks = {
         "watertight": bool(mesh.is_watertight),
         "consistent_winding": bool(mesh.is_winding_consistent),
@@ -79,7 +106,13 @@ def main():
         "genus": genus,
         "checks": checks,
         "printable": all(checks.values()),
+        # Named like cutout.py's components_dropped, and carrying the same
+        # warning: on most meshes these are reconstruction crumbs, but on a
+        # two-part subject this is where the second part went.
+        "components_dropped": len(dropped),
     }
+    if dropped:
+        result["dropped_face_counts"] = dropped[:10]
 
     warnings = []
     if not all(checks.values()):

@@ -408,7 +408,11 @@ which is where the 35s floor comes from.
 `export_stl` rotates glTF's Y-up into the Z-up every slicer expects,
 scales to a target height in millimetres (STL is unitless and read as mm),
 and drops the model onto the bed at the origin. It reports enclosed
-volume, bounding-box fill, genus, and four solidity checks, and reports
+volume, bounding-box fill, genus, and four solidity checks. It drops
+detached specks first — undecimated output carries a tail of them, and they
+are the only reason a closed figure reports not watertight, so this is what
+makes `max_faces=0` printable — reporting the count as
+`components_dropped`. It also reports
 `detail_pitch_mm` — the surface sampling pitch at that scale, which on an
 undecimated mesh is exactly `height_mm / octree`. It is warned against
 `min_wall_mm` in both directions: below it the printer is the limit, well

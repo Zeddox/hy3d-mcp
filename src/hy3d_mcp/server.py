@@ -703,6 +703,15 @@ def export_stl(
     Also drops the model onto z=0 so it sits on the plate, centres it, and
     reports the manifold checks that decide whether it slices at all.
 
+    Detached islands are removed before those checks run, and the count
+    comes back as components_dropped. Undecimated output arrives with a
+    tail of them -- a single-view figure at octree 384 had fifteen, the
+    largest 376 faces against 669,656 -- and they are the sole reason such
+    a mesh reported not watertight, not a single body and no enclosed
+    volume while the figure itself was closed with zero broken faces. This
+    is not a repair pass; no surface is touched. Read the count anyway: on
+    a two-part subject it is where the second part went.
+
     Read bbox_fill_pct in the result, not just the checks. A thin hollow
     shell and a solid can both be watertight, single-body and genus 0 with
     identical silhouettes; the enclosed volume is what separates them, and

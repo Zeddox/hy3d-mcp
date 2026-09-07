@@ -185,12 +185,17 @@ These are weaker than they look, and none of them will fix a wrong shape —
 that is always the concept image's job. Each is unset by default; move one
 at a time and keep the seed fixed so you can attribute the difference.
 
-- `octree` (384) — marching-cubes resolution. **This is a tessellation
-  density dial, not a detail dial.** Measured on the same concept at the
-  same seed, 512 produced nearly twice the triangles describing the same
-  surface, recovered no additional relief, and took twice as long. Reach
-  for it for one specific failure — thin parts (struts, masts, antennae)
-  coming out **fused into the hull** — and not as a general quality lever.
+- `octree` (384) — marching-cubes resolution, and the number that sets the
+  print pitch: an undecimated mesh samples every `height_mm / octree`.
+  **It is a tessellation density dial, not a detail dial.** Measured twice
+  at the same seed on the same concept — once on a pagoda, once on a
+  standing figure with separate fingers, rope wraps and a serrated blade —
+  512 produced nearly twice the triangles describing the same surface,
+  recovered no additional relief, and took twice as long. Reach for it for
+  one specific failure — thin parts (struts, masts, antennae) coming out
+  **fused into the hull** — or when a print needs a finer pitch than
+  `height_mm / 384`. On 8GB it spills even on a single view, so pass
+  `cpu_offload=True` with it.
 - `steps` (50) — shape diffusion steps. Diminishing well before this.
 - `guidance` (5.0) — how tightly the mesh follows the image. Higher is more
   faithful but over-sharpens.
@@ -256,6 +261,15 @@ Read the result properly before calling anything printable:
   for the common 0.4mm, 0.4 for a 0.2mm — the default assumes 0.4mm.
 - `genus` — tunnels through the surface. Slices fine, but worth checking it
   is intentional rather than a reconstruction artefact.
+- `components_dropped` — detached islands removed before the checks ran.
+  Undecimated output arrives with a tail of them, and they are the only
+  reason such a mesh reports not watertight while the figure itself is
+  closed; dropping them is what makes `max_faces=0` printable at all. The
+  hazard is the same as the cutout's: on a two-part subject this is where
+  the second part went. `dropped_face_counts` says how big they were — if
+  the largest is a meaningful fraction of the model, look before slicing.
+  Note that a stray slab **fused** to the figure is not a separate
+  component and will not be dropped here; that one is a cutout problem.
 
 ## Iterating
 
@@ -266,12 +280,25 @@ Read the result properly before calling anything printable:
 - Soft or mushy **form** → check the concept first. Dramatic lighting, a
   background gradient, or a surviving shadow cost more than any knob buys,
   and a regenerated concept is seconds against minutes.
-- Thin parts fused into the hull → this is the one case for `octree` 512.
+- Thin parts fused into the hull → this is the one case for `octree` 512,
+  and on an 8GB card it spills on a single view, so pair it with
+  `cpu_offload=True`.
+- **Face or head too coarse on a full-body figure** → not an octree
+  problem, and raising it will not help. The shape model conditions on
+  DINOv2 at 518px with patch 14, so the whole frame is 37x37 tokens. On a
+  standing figure the face is roughly 2.5 x 2.5 of them — about 6 tokens of
+  1369 — and no generator knob adds information that is not there.
+  Measured: 384 vs 512 on the same figure gave 1.78x the triangles for
+  1.82x the time and an identically featureless face. The fix is framing.
+  Generate a second, head-framed concept image and a second model from it;
+  that face gets the full 518px. Say this plainly rather than spending
+  minutes on knobs.
 - Phantom pancake of geometry under the model → a shadow survived in the
   concept; regenerate with "floating, no shadow".
 - Too heavy for the target engine → lower `max_faces`. Decimation happens
   inside the generation call, on the raw mesh, and preserves
   watertightness. Do not run a separate remesh or repair pass over a
-  finished GLB.
+  finished GLB — `export_stl`'s island drop is not that: it removes
+  detached specks and touches no surface.
 - User wants colour → `paint=True`, or `paint_mesh` on a GLB they already
   have. No trip outside this server since 0.10.0.

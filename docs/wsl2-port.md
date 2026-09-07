@@ -143,6 +143,32 @@ wall-clock of 384 and yields no additional relief; it changes tessellation
 density, not what the model represents. Reach for octree when thin struts fuse
 together, not as a detail dial.
 
+That was measured on a pagoda, so it was re-run on the case most likely to
+break it: a standing elf with separate fingers, rope wraps, pointed ears and a
+serrated blade. Same cutout, same seed 42, single front view, `max_faces 0`.
+
+| octree | faces | wall clock | peak torch reserved | pitch at 240mm |
+|---|---|---|---|---|
+| 384 | 670,656 | 154.6s | 6.22 GiB | 0.65mm |
+| 512 | 1,193,242 | 281.8s | **7.35 GiB, past the 6.96 ceiling** | 0.48mm |
+
+1.78x the triangles for 1.82x the time, and a head-crop render of each shows
+no facial gain — no eyes at either setting, the mouth a shallow crease at
+both, and the hair strands, if anything, slightly softer at 512. The finding
+holds on a thin-detail subject, and 512 additionally spills on a single view
+at 8GB, so it cannot be bundled into a print preset without `cpu_offload`.
+
+The reason is upstream of the octree and is worth stating with numbers,
+because it is the question users actually ask ("why is the face so
+undetailed?"). The shape model conditions on DINOv2 at 518x518 with patch 14,
+so 37x37 = 1369 tokens over the whole padded frame. That elf came from a
+multiview sheet cut into strips: 383x1024, figure 824px tall, face 60px. After
+the pipeline crops-and-pads to 890 square and the encoder resizes to 518, the
+face is ~35px -- **2.5 x 2.5 patches, about 6 tokens of 1369**. No octree
+setting adds information that is not in those 6 tokens. A head-framed concept
+image gives the same face the full 518, and that is the only lever that moves
+it.
+
 Plan for ornament to come from normal or displacement maps in the texture
 step, not from geometry.
 
