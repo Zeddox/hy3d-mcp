@@ -317,6 +317,21 @@ result in three.js, and export an STL with the printability checks attached.
 The **Multiview** toggle opens three more slots — left, back, right — and
 switches the run to the checkpoint that reads them; it greys itself out with
 the fix when that checkpoint is not downloaded.
+
+The **target** picker under it is the one preset worth having, because the
+setting it turns on is the least discoverable and most consequential one in
+the page: *3D print* sets `max faces` to 0, which means "keep every triangle
+marching cubes produced" and reads least like that in a box labelled max
+faces, and clears the texture toggle, because an STL carries neither UVs nor
+colour. *Game engine* puts back the 40,000-face budget. It reflects the form
+rather than remembering the click, so hand-editing either field drops it back
+to neither, and it deliberately leaves `octree` alone — 512 measured 1.78×
+the triangles for 1.82× the wall clock with no gain in the face, and spilled
+past the card's ceiling doing it. Min wall is remembered across sessions,
+since the nozzle is a property of the printer rather than of the model; height
+is not. **CPU offload** is inside Settings beside the octree box it exists
+for: without it, raising octree is a trap, because a job that overruns VRAM
+does not fail, it spills into host RAM and crawls at bus speed.
 Anything already generated is in the Outputs list, and `?glb=/files/<name>.glb`
 opens straight into a mesh — a reload keeps what you were looking at.
 

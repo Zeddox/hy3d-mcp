@@ -130,6 +130,12 @@
   .toggle strong { color: var(--ink); font-weight: 600; }
   .toggle.off { opacity: .55; cursor: not-allowed; }
 
+  /* The target picker is a row, not a card: it sets two fields that already
+     exist below it, and should not look like a third thing to fill in. */
+  .target { display: flex; align-items: center; gap: 10px; margin-top: 14px; }
+  .target .lbl { font-size: 11.5px; color: var(--muted); letter-spacing: .02em; }
+  .target .seg button { padding: 6px 11px; font-size: 12.5px; }
+
   .rail .seg { width: 100%; margin-bottom: 10px; }
   .rail .seg button { flex: 1; padding: 7px 10px; font-size: 12.5px; }
 
@@ -285,7 +291,20 @@
       <p class="notes" id="mvnote" hidden style="margin:10px 0 0">Front is required;
         the back view is the one that pays. Same subject, same scale, turned
         90° at a time — a turntable render or an orthographic sheet. Views that
-        disagree about proportion give a worse mesh than the front alone.</p>
+        disagree about proportion give a worse mesh than the front alone.
+        Cutting a contact sheet into strips is the exception worth knowing:
+        each strip is then a fraction of the sheet's width, and the generator
+        resizes whatever it gets to 518px — so a figure that was 200px tall in
+        the strip arrives with a face a handful of pixels across, and no
+        setting downstream can put back detail the conditioner never saw.</p>
+      <div class="target">
+        <span class="lbl">target</span>
+        <div class="seg" id="target">
+          <button data-target="game" aria-pressed="true">Game engine</button>
+          <button data-target="print" aria-pressed="false">3D print</button>
+        </div>
+      </div>
+      <p class="notes" id="targetnote" style="margin:8px 0 0"></p>
       <details class="adv">
         <summary>Settings</summary>
         <div class="fields">
@@ -305,6 +324,14 @@
               <option value="tencent/Hunyuan3D-2mini">2mini (2× faster, can come back hollow)</option>
             </select></div>
         </div>
+        <label class="toggle" id="offloadrow">
+          <input type="checkbox" id="cpu_offload">
+          <span><strong>CPU offload</strong> — keeps each stage in host RAM
+          until its turn, trading speed for headroom. Raising octree past the
+          default is what needs it: at 512 the run peaks over an 8GB card's
+          ceiling, and a job that overruns does not fail, it spills into host
+          RAM and crawls at bus speed.</span>
+        </label>
       </details>
       <label class="toggle" id="paintrow">
         <input type="checkbox" id="paint">
@@ -516,6 +543,49 @@ $("workflow").addEventListener("click", (e) => {
   refreshGo();
 });
 
+/* ---------- target ---------- */
+// The two targets differ in exactly two fields, and both of them sit behind a
+// collapsed disclosure where nobody finds them. max_faces is the one that
+// matters: 40,000 is the budget an engine wants, and 0 means "keep every
+// triangle marching cubes produced", which is what a slicer wants and what a
+// box labelled "max faces" reads least like.
+//
+// Octree is deliberately not part of this. Raising it to 512 on the same
+// cutout and seed measured 1.78x the triangles for 1.82x the wall clock with
+// no gain in the face at all, and spilled past this card's ceiling doing it —
+// a print preset that quietly did that would be selling a knob that does not
+// deliver. Height and min wall are not here either: they live on the print
+// card, which stays hidden until a mesh exists, and neither is a property of
+// the target anyway — min wall is a property of the nozzle.
+const TARGETNOTE = {
+  game: "40,000 faces, and free to carry a texture — the shape an engine wants.",
+  print: "Every triangle kept, and no texture: an STL carries neither UVs nor "
+       + "colour, so the surface is the whole file. Set height and min wall on "
+       + "the print card once the mesh is here.",
+  custom: "Neither target's defaults — max faces or the texture toggle has been "
+        + "changed by hand.",
+};
+function syncTarget() {
+  // Read the form rather than remember what was clicked: a pressed button that
+  // no longer describes the fields is worse than no button at all.
+  const faces = $("max_faces").value;
+  const name = faces === "0" && !$("paint").checked ? "print"
+             : faces === "40000" ? "game" : "custom";
+  for (const b of $("target").children) {
+    b.setAttribute("aria-pressed", String(b.dataset.target === name));
+  }
+  $("targetnote").textContent = TARGETNOTE[name];
+}
+$("target").addEventListener("click", (e) => {
+  const b = e.target.closest("button[data-target]"); if (!b) return;
+  if (b.dataset.target === "game") { $("max_faces").value = "40000"; }
+  else { $("max_faces").value = "0"; $("paint").checked = false; }
+  syncTarget();
+});
+$("max_faces").addEventListener("input", syncTarget);
+$("paint").addEventListener("change", syncTarget);
+syncTarget();
+
 /* ---------- running ---------- */
 const num = (n) => n?.toLocaleString?.() ?? n;
 function stat(label, value, cls) {
@@ -537,7 +607,10 @@ function showResult(r) {
   const bits = [];
   if (r.stages) bits.push('<span class="stage-line">' + r.stages.join("  →  ") + "</span>");
   if (r.warning) bits.push('<span class="warn">' + r.warning + "</span>");
-  bits.push("Untextured by design — this build has no paint stage. Materials are a job for Blender or Godot.");
+  // Only when it is actually untextured. This line used to be unconditional,
+  // which meant a painted run printed "this build has no paint stage" directly
+  // under a stat reading "texture: baked albedo".
+  if (!r.textured) bits.push("Untextured — tick “Texture it too” for a baked albedo, or leave materials to Blender or Godot.");
   $("notes").innerHTML = bits.join("<br>");
 }
 function setRunning(on) {
@@ -578,6 +651,7 @@ $("go").addEventListener("click", async () => {
     fd.append("paint", "1");
     if ($("texture_size").value) fd.append("texture_size", $("texture_size").value);
   }
+  if ($("cpu_offload").checked) fd.append("cpu_offload", "1");
   setRunning(true);
   $("fill").style.width = "2%"; $("runmsg").textContent = "starting"; $("notes").textContent = "";
   const r = await (await fetch("/api/generate", { method: "POST", body: fd })).json();
@@ -595,6 +669,18 @@ $("cancel").addEventListener("click", async () => {
 });
 
 /* ---------- stl ---------- */
+// The nozzle is a property of the printer, so min wall is the one field on
+// this card worth remembering: 0.8 is right for the common 0.4mm nozzle and
+// wrong for every other, and the alternative is retyping it on every export
+// forever. Height is not remembered — that genuinely is per-object.
+const WALL_KEY = "hy3d.min_wall_mm";
+try {
+  const saved = localStorage.getItem(WALL_KEY);
+  if (saved) $("wall").value = saved;
+} catch (e) { /* private windows and blocked site data both throw here */ }
+$("wall").addEventListener("change", () => {
+  try { localStorage.setItem(WALL_KEY, $("wall").value); } catch (e) {}
+});
 $("stl").addEventListener("click", async () => {
   if (!state.glb) return;
   $("stl").disabled = true; $("stlnotes").textContent = "slicing check running…";
@@ -607,6 +693,12 @@ $("stl").addEventListener("click", async () => {
   $("stlout").innerHTML =
     '<span class="chip">' + r.size_mm.join(" × ") + " mm</span>" +
     '<span class="chip">' + r.volume_cm3 + " cm³</span>" +
+    // The pitch is the number the min wall box is there to be compared against;
+    // the dropped count is where a two-part subject's second part went.
+    '<span class="chip">' + r.detail_pitch_mm + " mm pitch</span>" +
+    (r.components_dropped
+      ? '<span class="chip">' + r.components_dropped + " island" +
+        (r.components_dropped > 1 ? "s" : "") + " dropped</span>" : "") +
     '<span class="chip' + (r.bbox_fill_pct < 8 ? " fail" : "") + '">' + r.bbox_fill_pct + "% of bbox</span>" +
     Object.entries(r.checks).map(([k, v]) =>
       '<span class="chip ' + (v ? "pass" : "fail") + '">' + k + (v ? " ✓" : " ✗") + "</span>").join("");

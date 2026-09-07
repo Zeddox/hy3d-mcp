@@ -172,7 +172,7 @@ async def api_generate(request):
         except _BadUpload as e:
             return JSONResponse({"error": str(e)}, e.status)
         for key in ("octree", "steps", "max_faces", "seed", "guidance",
-                    "model", "paint", "texture_size"):
+                    "model", "paint", "texture_size", "cpu_offload"):
             if form.get(key):
                 settings[key] = form[key]
     else:
@@ -210,6 +210,12 @@ async def api_generate(request):
             kwargs["paint"] = True
             if settings.get("texture_size") not in (None, ""):
                 kwargs["texture_size"] = int(settings["texture_size"])
+        # Same contract for the offload switch. Without it the octree field is
+        # a trap: it accepts 512, and 512 overruns an 8GB card -- which does
+        # not fail, it spills into host RAM and runs at bus speed -- with no
+        # control anywhere in the UI to prevent it.
+        if settings.get("cpu_offload") not in (None, "", "0", "false", False):
+            kwargs["cpu_offload"] = True
         for tag, path in views.items():
             kwargs[tag + "_image"] = str(path)
     except (TypeError, ValueError) as e:
