@@ -211,6 +211,14 @@
   .seg button + button { border-left: 1px solid var(--line); }
   .seg button[aria-pressed="true"] { background: var(--accent); color: var(--accent-in); }
   .toolbar .spacer { margin-left: auto; }
+  /* The run's *name*, not its job id. The id dies with the server process and
+     names nothing on disk; the name is the GLB's filename, is what the Outputs
+     list shows, and survives a restart -- so it is the one worth quoting. */
+  .runname {
+    font-family: "IBM Plex Mono", monospace; font-size: 12px; color: var(--muted);
+    background: none; border: none; padding: 4px 6px; cursor: copy;
+  }
+  .runname:hover { color: var(--ink); }
 
   .stats { display: grid; grid-template-columns: repeat(auto-fit, minmax(118px, 1fr)); gap: 1px;
            background: var(--line); border: 1px solid var(--line); border-radius: var(--radius);
@@ -373,6 +381,7 @@
       <button id="reset">Reset view</button>
       <span class="spacer"></span>
       <button id="cancel" hidden>Cancel run</button>
+      <button class="runname" id="runname" hidden title="copy this name"></button>
       <a class="dl" id="glbdl" hidden download>Download GLB</a>
     </div>
 
@@ -462,6 +471,10 @@ function loadGLB(url) {
     fit();
     state.glb = url;
     $("glbdl").hidden = false; $("glbdl").href = url;
+    // Set here rather than in showResult so a mesh opened from Outputs or from
+    // ?glb= is named too -- those have no run behind them, only a file.
+    const name = decodeURIComponent(url.split("/").pop() || "").replace(/\.glb$/, "");
+    $("runname").textContent = name; $("runname").hidden = !name;
     $("printcard").hidden = false;
     $("stldl").hidden = true; $("stlout").textContent = ""; $("stlnotes").textContent = "";
   }, undefined, (e) => { $("notes").innerHTML = '<span class="warn">could not load that GLB: ' + e + "</span>"; });
@@ -470,6 +483,12 @@ $("shading").addEventListener("click", (e) => {
   const b = e.target.closest("button[data-mode]"); if (!b) return;
   state.mode = b.dataset.mode; applyMode();
   for (const x of $("shading").children) x.setAttribute("aria-pressed", String(x === b));
+});
+$("runname").addEventListener("click", () => {
+  const name = $("runname").textContent;
+  navigator.clipboard?.writeText(name);
+  $("runname").textContent = "copied";
+  setTimeout(() => { $("runname").textContent = name; }, 900);
 });
 $("reset").addEventListener("click", () => {
   camera.position.copy(HOME); controls.target.set(0, 0, 0); controls.update();
@@ -594,10 +613,18 @@ function stat(label, value, cls) {
 function showResult(r) {
   const spill = r.peak_reserved_gib && r.vram_ceiling_gib &&
                 r.peak_reserved_gib >= r.vram_ceiling_gib - 0.1;
+  // Nothing was decimated, so this is raw marching-cubes output. The decimation
+  // branch runs FloaterRemover on the way past; skipping it -- which max faces 0
+  // does -- keeps the specks, and a handful of stray faces is enough to make the
+  // whole file read not watertight while the figure itself is closed. That is
+  // the normal state for a print run, not an alarm, so it does not get the
+  // amber. The STL panel is the authority: it drops them first, then checks.
+  const undecimated = r.faces === r.raw_faces;
   $("stats").innerHTML = [
     stat("faces", num(r.faces) + ' <span class="of">of ' + num(r.raw_faces) + "</span>"),
     stat("vertices", num(r.verts)),
-    stat("watertight", r.watertight ? "yes" : "no", r.watertight ? "" : "warn"),
+    stat("watertight", r.watertight ? "yes" : "no",
+         r.watertight || undecimated ? "" : "warn"),
     stat("peak VRAM", (r.peak_reserved_gib ?? "?") + ' <span class="of">/ ' +
          (r.vram_ceiling_gib ?? "?") + " GiB</span>", spill ? "warn" : ""),
     stat("wall clock", Math.round(r.seconds) + "s"),
@@ -607,6 +634,12 @@ function showResult(r) {
   const bits = [];
   if (r.stages) bits.push('<span class="stage-line">' + r.stages.join("  →  ") + "</span>");
   if (r.warning) bits.push('<span class="warn">' + r.warning + "</span>");
+  if (!r.watertight && undecimated) bits.push(
+    "“watertight: no” is the expected reading with max faces at 0. Undecimated " +
+    "output arrives as the closed figure plus a tail of detached specks — a few " +
+    "hundred faces at most against hundreds of thousands — and they are the only " +
+    "reason the whole file reads open. Export STL: it drops them before it checks, " +
+    "and tells you how many went.");
   // Only when it is actually untextured. This line used to be unconditional,
   // which meant a painted run printed "this build has no paint stage" directly
   // under a stat reading "texture: baked albedo".

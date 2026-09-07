@@ -333,7 +333,19 @@ is not. **CPU offload** is inside Settings beside the octree box it exists
 for: without it, raising octree is a trap, because a job that overruns VRAM
 does not fail, it spills into host RAM and crawls at bus speed.
 Anything already generated is in the Outputs list, and `?glb=/files/<name>.glb`
-opens straight into a mesh — a reload keeps what you were looking at.
+opens straight into a mesh — a reload keeps what you were looking at. The name
+beside the download link is that file's, and copies on click: it is the one
+handle worth quoting, because a job id dies with the server process while the
+name is what is actually on disk.
+
+One reading to expect from the print target: **watertight: no** on the generate
+card. The decimation branch runs `FloaterRemover` on the way past, so setting
+`max faces` to 0 skips it, and the raw mesh keeps the tail of detached specks
+marching cubes leaves behind — measured at nine, from 400 faces down to 1,
+against a closed 681,264-face figure. A handful of stray faces is enough to
+make the whole file read open, so the stat is true and useless. It is not
+flagged amber there, and the STL export is the authority: it drops them before
+it checks, reports how many went, and that mesh comes back watertight.
 
 It is a separate process from the MCP server and shares nothing with it but
 the code and the GPU queue, so running both at once is safe. It binds
