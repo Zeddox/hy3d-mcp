@@ -171,7 +171,8 @@ async def api_generate(request):
                     views[tag] = (await _save_upload(form, tag, stem))[0]
         except _BadUpload as e:
             return JSONResponse({"error": str(e)}, e.status)
-        for key in ("octree", "steps", "max_faces", "seed", "guidance", "model"):
+        for key in ("octree", "steps", "max_faces", "seed", "guidance",
+                    "model", "paint", "texture_size"):
             if form.get(key):
                 settings[key] = form[key]
     else:
@@ -201,6 +202,14 @@ async def api_generate(request):
                 kwargs[key] = cast(settings[key])
         if settings.get("model"):
             kwargs["model"] = str(settings["model"])
+        # A checkbox arrives as the string "1", or not at all; JSON callers
+        # send a real bool. Both have to mean the same thing, and "0" must
+        # not be truthy.
+        paint = settings.get("paint")
+        if paint not in (None, "", "0", "false", False):
+            kwargs["paint"] = True
+            if settings.get("texture_size") not in (None, ""):
+                kwargs["texture_size"] = int(settings["texture_size"])
         for tag, path in views.items():
             kwargs[tag + "_image"] = str(path)
     except (TypeError, ValueError) as e:

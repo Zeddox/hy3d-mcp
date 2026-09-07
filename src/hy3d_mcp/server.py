@@ -539,11 +539,14 @@ async def generate_model(
                 cmd.append("--cpu-offload")
             if paint:
                 cmd += ["--paint", "--texture-size", str(texture_size)]
-            rc, so, se, streamed = await _run_engine(cmd, os.environ.copy(), ctx)
+            # One engine process now covers both stages, so "shape:" would
+            # label the paint half wrongly for half the run.
+            rc, so, se, streamed = await _run_engine(
+                cmd, os.environ.copy(), ctx, "generate" if paint else "shape")
             if rc != 0 or not dst.is_file():
                 _record_job("generate_model", src.name, False,
                             time.monotonic() - started)
-                raise RuntimeError("shape generation failed (exit %d):\n%s"
+                raise RuntimeError("generation failed (exit %d):\n%s"
                                    % (rc, (se or so)[-2000:]))
             stats = _engine_json(so)
             if not stats:
@@ -644,7 +647,8 @@ async def paint_mesh(mesh_path: str, image_path: str,
                    "-o", str(dst), "--paint-mesh", str(mesh),
                    "--texture-size", str(texture_size),
                    "--engine", str(ENGINE_REPO)]
-            rc, so, se, streamed = await _run_engine(cmd, os.environ.copy(), ctx)
+            rc, so, se, streamed = await _run_engine(
+                cmd, os.environ.copy(), ctx, "paint")
             if rc != 0 or not dst.is_file():
                 _record_job("paint_mesh", mesh.name, False,
                             time.monotonic() - started)
@@ -1020,9 +1024,9 @@ def _server_status() -> dict:
             % (rasterizer_line.split(" ", 1)[-1] if " " in rasterizer_line
                else "custom_rasterizer"))
     if not have_paint_weights:
-        missing.append("the paint weights are not under %s (~10.4GB; fetch "
-                       "and prepare them with `bash install.sh --with-paint`)"
-                       % paint_dir)
+        missing.append("the paint weights are not under %s (a 10.4GB "
+                       "download, 16GB once prepared; fetch them with "
+                       "`bash install.sh --with-paint`)" % paint_dir)
     paint_ready = _check(not missing, "texturing is unavailable: %s. Shape "
                                       "generation does not need either and is "
                                       "unaffected." % "; and ".join(missing))

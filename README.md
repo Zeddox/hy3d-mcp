@@ -6,13 +6,16 @@ An MCP server that turns a single concept image into a game-ready 3D mesh
 call: background cutout → shape → decimation → watertight GLB. A second
 call exports print-ready STL.
 
-**Shape only — the output has no texture.** The texture stage needs far
-more VRAM than an 8GB consumer card has, so `paint_mesh` refuses with an
-explanation rather than half-running. Carved ornament in your concept art
-comes back as smooth surface; that is what normal and displacement maps are
-for, applied later. This is a property of the shape model, not a tuning
-failure — `octree` is a tessellation-density dial, not a detail dial, and
-raising it recovers no relief.
+**Texture is opt-in and fits.** `paint=True` adds UVs and a baked albedo in
+about 85 seconds — 6.77 GiB peak against a 6.96 GiB ceiling, at a 1024 bake.
+See [Texturing](#texturing). Diffuse colour only: no normal or roughness map.
+
+**Relief is the thing neither stage gives you.** Carved ornament in your
+concept art comes back as smooth surface, and the texture pass paints it on
+rather than cutting it in. That is a property of the shape model, not a
+tuning failure — `octree` is a tessellation-density dial, not a detail dial,
+and raising it recovers no relief. Normal and displacement maps are the
+answer, applied later.
 
 This branch is a port of the original Apple Silicon / MLX server. See
 [`docs/wsl2-port.md`](docs/wsl2-port.md) for what carried over, what did
@@ -164,8 +167,9 @@ what a by-the-book install of the upstream repo gets wrong, and what
 | `server_status` | full setup diagnostic, queue depth, last job | instant |
 | `setup_engine` | runs `install.sh`; dry run unless `confirm=true` | instant (plan) / up to an hour (apply) |
 | `cancel_job` | kill the running engine and free the queue | instant |
-| `finish_model` | game-look texture pass — needs a GLB textured elsewhere | seconds |
-| `paint_mesh` | unavailable on this build; refuses with an explanation | — |
+| `generate_model` w/ `paint=True` | the same, plus a baked albedo | +~85s |
+| `paint_mesh` | texture a GLB that already exists | ~85s |
+| `finish_model` | game-look pass over an already-textured GLB | seconds |
 
 Generation is serialized — one job at a time, machine-wide. The queue is an
 `flock`, not just an in-process lock, so a job started from the workbench
@@ -218,6 +222,51 @@ instead of one lumpy asymmetric one, bows with a knot rather than blocks, a
 hairline where the single-image mesh had a smooth ball, and fingers instead
 of mittens. The subject was near-symmetric, which understates it — a
 backpack, cape or tail is where a single front view has nothing to go on.
+
+## Texturing
+
+Off by default, one flag to turn on:
+
+```python
+generate_model(image_path="viking.png", paint=True)     # shape, then texture
+paint_mesh(mesh_path="viking.glb", image_path="viking.png")   # an existing GLB
+```
+
+You get a GLB carrying `TEXCOORD_0` and a baked albedo, which Godot imports
+and lights without a trip through Blender. Diffuse colour only — no normal,
+roughness or metallic map — and the exporter sets `metallicFactor` to 0,
+because trimesh defaults it to 1.0 and an albedo under a metallic material
+renders as near-black.
+
+**`texture_size` 1024 is a ceiling, not a cautious default.** Upstream bakes
+at 2048, which is four times the buffer area across six cameras and
+does not fit in 8GB; on WSL2 it will not fail, it will spill into host RAM
+and finish an hour later. At 1024 the pass peaks at 6.77 GiB against 6.96
+GiB free — measured at 40,000 faces, and a much denser mesh moves that
+number, since the bake rasterises real geometry per view.
+
+**Cross-view agreement is the known weakness.** Six cameras are baked with
+weights `[1, 0.1, 0.5, 0.1, 0.05, 0.05]`, so the front dominates by 10x and
+anything only the back camera sees is resolved on its own. On a test viking
+that showed up as fur pauldrons reading brown in front and grey behind.
+
+Setup is separate from the shape install, because it is another 10.4GB and
+the only part of this project that needs a compiler:
+
+    ./hy3d install --with-paint
+
+That fetches the weights, converts the two components that ship as pickles
+(transformers 5 will not open them under torch 2.5), rebuilds the turbo
+unet's `.bin` from the safetensors beside it rather than pulling a 7.33GB
+fp32 duplicate, and compiles `custom_rasterizer` against a user-local CUDA
+12.4 it unpacks from NVIDIA's own debs — no root, no system CUDA. Until it
+has run, `server_status` reports `paint_ready: false` with the missing half
+named, the workbench greys out its texture checkbox, and shape generation
+carries on unaffected. Rebuilding the engine venv discards the compiled
+extension; `scripts/build-rasterizer.sh` puts it back.
+
+The measurements and the four upstream repairs behind all of this are in
+[`docs/paint-spike-2026-09-06.md`](docs/paint-spike-2026-09-06.md).
 
 ## The workbench
 
@@ -275,6 +324,14 @@ concept with no manual prep:
 | after decimation | 40,000 faces / 20,002 verts, still watertight |
 | attributes | `NORMAL`, `POSITION` |
 | peak VRAM reserved | 6.22 GiB against 6.96 GiB free |
+
+With `paint=True`, on the same card at a 1024 bake:
+
+| | |
+|---|---|
+| wall clock | ~160s total, of which ~48–70s is the paint pass |
+| attributes | `NORMAL`, `POSITION`, `TEXCOORD_0` + a baked albedo |
+| peak VRAM reserved | 6.77 GiB against 6.96 GiB free |
 
 The model reloads on every call — each generation is a fresh subprocess —
 which is where the 35s floor comes from.
@@ -334,11 +391,9 @@ the finest detail in the mesh falls below your nozzle's minimum wall.
 ## Non-goals
 
 - No cloud fallback.
-- No texture stage on this build. Not a philosophical position — an 8GB
-  card cannot run it.
+- No PBR maps. The texture pass bakes diffuse colour and nothing else —
+  no normal, roughness or metallic map.
 - No batch tool — loop `generate_model`; the queue serializes.
-- No multiview input **yet** — the pipeline is single-image at every entry
-  point. Investigated and specced, not built; see below.
 
 ## Investigations
 
@@ -372,8 +427,9 @@ The pipeline runs on Tencent's Hunyuan3D weights, which you download
 yourself and which are governed by the **Tencent Hunyuan 3D 2.0 Community
 License Agreement**
 ([2.0](https://huggingface.co/tencent/Hunyuan3D-2/blob/main/LICENSE)).
-This build fetches the shape checkpoint only; the 2.1 paint weights the
-macOS build also used are not downloaded here. Highlights, not legal
+This build fetches the 2.0 shape checkpoint, and — with `--with-mv` or
+`--with-paint` — the 2.0 multiview and paint weights. The 2.1 weights the
+macOS build used are not downloaded here. Highlights, not legal
 advice; read the license:
 
 - **Territory:** the license does not apply in the European Union, the

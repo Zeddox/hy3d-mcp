@@ -74,8 +74,10 @@ them is not a guess: a strict load of anything wider would fail, so upstream's
 own `.bin` must contain exactly these 1535. The rendered result confirms it —
 wrong weights produce noise, not a correctly coloured viking.
 
-Net: ~10.4GB of weights on disk instead of ~18, and one fewer pickle in the
-loading path than upstream has.
+Net: a 10.4GB download instead of ~18, and one fewer pickle in the loading
+path than upstream has. On disk it settles at 16GB, because each conversion
+leaves its source beside the result; `paint-weights.py` prints the 5.4GB that
+nothing loads any more, and deletes none of it.
 
 ## What the texture actually looks like
 

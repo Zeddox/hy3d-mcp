@@ -74,3 +74,17 @@ def build_unet_bin(root: Path) -> None:
 
 
 build_unet_bin(ROOT)
+
+# 10.4GB comes down and 16GB stays, because every conversion above leaves its
+# source beside the result. Nothing here deletes a file the user paid to
+# download -- but say which ones are now dead, since on a machine tight enough
+# to need a 1024 bake, 5.4GB is worth knowing about.
+redundant = [ROOT / r for r in ("text_encoder/pytorch_model.bin",
+                                "vae/diffusion_pytorch_model.bin",
+                                "unet/diffusion_pytorch_model.safetensors")]
+have = [r for r in redundant if r.is_file()]
+if have:
+    total = sum(r.stat().st_size for r in have) / 1e9
+    print("note  %.1fGB is now redundant -- nothing loads these any more:" % total)
+    for r in have:
+        print("      %s" % r)

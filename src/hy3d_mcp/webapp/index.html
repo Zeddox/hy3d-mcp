@@ -116,6 +116,20 @@
      label -- before that the empty hint already says which view this is. */
   .views.mv .drop.filled .tag { display: block; }
 
+  /* The paint toggle is a decision, not a setting: it doubles the wall
+     clock and changes what the file is, so it sits in the open above the
+     button rather than inside the Settings fold. */
+  .toggle {
+    display: flex; gap: 10px; align-items: flex-start; cursor: pointer;
+    margin-top: 12px; padding: 10px 12px; border-radius: 8px;
+    background: var(--sunken); border: 1px solid transparent;
+  }
+  .toggle:has(input:checked) { border-color: var(--accent); }
+  .toggle input { margin: 2px 0 0; accent-color: var(--accent); flex: none; }
+  .toggle span { font-size: 12px; color: var(--muted); line-height: 1.45; }
+  .toggle strong { color: var(--ink); font-weight: 600; }
+  .toggle.off { opacity: .55; cursor: not-allowed; }
+
   .rail .seg { width: 100%; margin-bottom: 10px; }
   .rail .seg button { flex: 1; padding: 7px 10px; font-size: 12.5px; }
 
@@ -283,6 +297,8 @@
             <input id="max_faces" type="number" min="0" step="1000" value="40000"></div>
           <div class="field"><label for="seed">seed</label>
             <input id="seed" type="number" value="42"></div>
+          <div class="field"><label for="texture_size">texture size</label>
+            <input id="texture_size" type="number" min="256" step="256" value="1024"></div>
           <div class="field wide"><label for="model" id="modellabel">model</label>
             <select id="model">
               <option value="">Hunyuan3D-2 (3.3B, solid)</option>
@@ -290,6 +306,12 @@
             </select></div>
         </div>
       </details>
+      <label class="toggle" id="paintrow">
+        <input type="checkbox" id="paint">
+        <span><strong>Texture it too</strong> — bakes a colour map onto the
+        mesh, about 85 seconds on top. You get UVs and a diffuse albedo, which
+        is what an engine can use directly; no normal or roughness map.</span>
+      </label>
     </section>
 
     <button class="primary" id="go" disabled>Generate</button>
@@ -510,6 +532,7 @@ function showResult(r) {
          (r.vram_ceiling_gib ?? "?") + " GiB</span>", spill ? "warn" : ""),
     stat("wall clock", Math.round(r.seconds) + "s"),
     r.views ? stat("views", r.views.join(" · ")) : "",
+    stat("texture", r.textured ? "baked albedo" : "none"),
   ].join("");
   const bits = [];
   if (r.stages) bits.push('<span class="stage-line">' + r.stages.join("  →  ") + "</span>");
@@ -551,6 +574,10 @@ $("go").addEventListener("click", async () => {
     if ($(k).value) fd.append(k, $(k).value);
   }
   if (!state.mv && $("model").value) fd.append("model", $("model").value);
+  if ($("paint").checked) {
+    fd.append("paint", "1");
+    if ($("texture_size").value) fd.append("texture_size", $("texture_size").value);
+  }
   setRunning(true);
   $("fill").style.width = "2%"; $("runmsg").textContent = "starting"; $("notes").textContent = "";
   const r = await (await fetch("/api/generate", { method: "POST", body: fd })).json();
@@ -618,8 +645,19 @@ $("gallery").addEventListener("click", (e) => {
     // construction — the single-image workflow is complete without it — so it
     // greys out one button instead of reporting the engine as broken.
     const bad = Object.entries(s)
-      .filter(([k, v]) => v && v.ok === false && k !== "mv_weights_cached")
+      .filter(([k, v]) => v && v.ok === false &&
+              k !== "mv_weights_cached" && k !== "paint_ready")
       .map(([k]) => k);
+    // Same treatment as the multiview checkpoint, and for the same reason:
+    // shape generation is complete without any of it, so the answer is a
+    // disabled checkbox carrying the fix rather than a broken engine.
+    if (s.paint_ready && s.paint_ready.ok === false) {
+      $("paint").disabled = true;
+      $("paintrow").classList.add("off");
+      $("paintrow").title = s.paint_ready.fix || "texturing is unavailable";
+      $("paintrow").querySelector("strong").textContent =
+        "Texture it too (unavailable)";
+    }
     if (s.mv_weights_cached && s.mv_weights_cached.ok === false) {
       const btn = $("workflow").querySelector('[data-mode="mv"]');
       btn.disabled = true;

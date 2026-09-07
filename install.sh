@@ -3,9 +3,10 @@
 # Guided setup for the Hunyuan3D-2 engine that hy3d-mcp shells out to,
 # on WSL2 or Linux with an NVIDIA card.
 #
-# Shape-only by design: an 8GB card cannot run the texture stage, so this
-# skips custom_rasterizer and DifferentiableRenderer entirely — the two
-# components whose compilation breaks most Windows/WSL installs.
+# Shape by default. --with-paint adds the texture stage, which needs ~10.4GB
+# more weights and a compiled custom_rasterizer — the component whose
+# compilation breaks most Windows/WSL installs, and which
+# scripts/build-rasterizer.sh handles by unpacking a user-local CUDA 12.4.
 #
 # Every phase is idempotent: it inspects the target and skips work that is
 # already done, so re-running after a failure resumes rather than restarts.
@@ -17,6 +18,7 @@
 #   ./install.sh --yes        run unattended (for CI or the setup_engine tool)
 #   ./install.sh --only 3     run a single phase
 #   ./install.sh --with-mv    also fetch the multiview checkpoint (+4.6GB)
+#   ./install.sh --with-paint also set up the texture stage (+10.4GB down)
 #
 # Phase numbers are a public contract — setup_engine(only=N) passes them
 # straight through — so they do not get renumbered.
@@ -41,6 +43,11 @@ SHAPE_HF="tencent/Hunyuan3D-2"
 SHAPE_SUB="hunyuan3d-dit-v2-0"
 # The multiview checkpoint, fetched only on request: it is another 4.6GB and
 # it buys nothing for the single-image workflow, which is what most runs are.
+# Paint lives in the base repo, in two subfolders, and needs the compiled
+# rasterizer as well as the weights -- see docs/paint-spike-2026-09-06.md.
+DELIGHT_SUB="hunyuan3d-delight-v2-0"
+PAINT_SUB="hunyuan3d-paint-v2-0-turbo"
+
 MV_HF="tencent/Hunyuan3D-2mv"
 MV_SUB="hunyuan3d-dit-v2-mv"
 # Upstream resolves weights from $HY3DGEN_MODELS (default ~/.cache/hy3dgen)
@@ -87,6 +94,7 @@ APT_LIBS=(libopengl0 libegl1)
 
 MODE=run          # run | plan
 WITH_MV=0         # fetch the multiview checkpoint too
+WITH_PAINT=0      # fetch the paint weights and build the rasterizer
 ASSUME_YES=0
 ONLY=""
 
@@ -115,6 +123,7 @@ while [ $# -gt 0 ]; do
         --yes|-y) ASSUME_YES=1 ;;
         --only)   ONLY="${2:-}"; shift ;;
         --with-mv) WITH_MV=1 ;;
+        --with-paint) WITH_PAINT=1 ;;
         --repo)   ENGINE_REPO="${2:-}"; shift ;;
         --venv)   ENGINE_VENV="${2:-}"; shift ;;
         -h|--help) usage ;;
@@ -123,6 +132,9 @@ while [ $# -gt 0 ]; do
     shift
 done
 
+# Where this script lives, so it can call its siblings in scripts/ no matter
+# where it was invoked from.
+HERE="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
 PY="$ENGINE_VENV/bin/python"
 UV="${UV:-$(command -v uv || echo "$HOME/.local/bin/uv")}"
 
@@ -326,10 +338,15 @@ download_weights() {
     local mv_dest="$MODELS_DIR/$MV_HF"
     local mv_ckpt="$mv_dest/$MV_SUB/model.fp16.safetensors"
 
-    local need_shape=1 need_u2net=1 need_mv=0
+    # The .bin, not the safetensors: it is the last artefact the preparation
+    # produces, so its absence means the whole paint step is unfinished.
+    local paint_ckpt="$dest/$PAINT_SUB/unet/diffusion_pytorch_model.bin"
+
+    local need_shape=1 need_u2net=1 need_mv=0 need_paint=0
     [ -f "$ckpt" ] && need_shape=0
     [ -f "$u2net" ] && need_u2net=0
     [ "$WITH_MV" = 1 ] && [ ! -f "$mv_ckpt" ] && need_mv=1
+    [ "$WITH_PAINT" = 1 ] && [ ! -f "$paint_ckpt" ] && need_paint=1
 
     [ "$need_shape" = 0 ] && skip "shape weights present ($(du -sh "$dest/$SHAPE_SUB" 2>/dev/null | cut -f1))"
     [ "$need_u2net" = 0 ] && skip "u2net present ($(du -h "$u2net" 2>/dev/null | cut -f1))"
@@ -341,11 +358,18 @@ download_weights() {
     elif [ "$WITH_MV" = 0 ]; then
         skip "multiview weights absent — pass --with-mv to fetch them (+4.6GB)"
     fi
-    [ "$need_shape" = 0 ] && [ "$need_u2net" = 0 ] && [ "$need_mv" = 0 ] && return 0
+    if [ -f "$paint_ckpt" ]; then
+        skip "paint weights present ($(du -shc "$dest/$PAINT_SUB" "$dest/$DELIGHT_SUB" 2>/dev/null | tail -1 | cut -f1))"
+    elif [ "$WITH_PAINT" = 0 ]; then
+        skip "paint weights absent — pass --with-paint to fetch them (10.4GB down, 16GB on disk)"
+    fi
+    [ "$need_shape" = 0 ] && [ "$need_u2net" = 0 ] && [ "$need_mv" = 0 ] \
+        && [ "$need_paint" = 0 ] && return 0
 
     if [ "$MODE" = plan ]; then
         [ "$need_shape" = 1 ] && work "download $SHAPE_HF/$SHAPE_SUB (~4.6GB)"
         [ "$need_mv" = 1 ] && work "download $MV_HF/$MV_SUB (~4.6GB)"
+        [ "$need_paint" = 1 ] && work "download the paint weights (~10.4GB) and build custom_rasterizer"
         [ "$need_u2net" = 1 ] && work "download u2net for rembg (~176MB)"
         return 0
     fi
@@ -364,6 +388,29 @@ download_weights() {
         fetch_ckpt "$MV_HF" "$MV_SUB" "$mv_dest" || return 1
         [ -f "$mv_ckpt" ] && ok "multiview weights in place" \
             || { bad "download finished but $mv_ckpt is missing"; return 1; }
+    fi
+
+    if [ "$need_paint" = 1 ]; then
+        confirm "download ~10.4GB of paint weights from HuggingFace (~16GB on disk once prepared)" || return 0
+        work "downloading the delight and paint-turbo subfolders"
+        # Two subfolders, and one file deliberately left behind: the turbo
+        # unet ships as both a 3.72GB fp16 safetensors and a 7.33GB fp32
+        # pickle of the same weights. paint-weights.py rebuilds what the
+        # loader actually opens from the smaller one.
+        "$PY" - "$SHAPE_HF" "$dest" "$DELIGHT_SUB" "$PAINT_SUB" <<'PAINTPY' || { bad "paint weight download failed"; return 1; }
+import sys
+from huggingface_hub import snapshot_download
+repo, dest, delight, paint = sys.argv[1:5]
+snapshot_download(repo_id=repo, local_dir=dest,
+                  allow_patterns=["%s/**" % delight, "%s/**" % paint],
+                  ignore_patterns=["%s/unet/diffusion_pytorch_model.bin" % paint])
+PAINTPY
+        work "converting the pickled components to safetensors"
+        "$PY" "$HERE/scripts/paint-weights.py" "$dest/$PAINT_SUB" \
+            || { bad "could not prepare the paint weights"; return 1; }
+        [ -f "$paint_ckpt" ] && ok "paint weights in place" \
+            || { bad "preparation finished but $paint_ckpt is missing"; return 1; }
+        bash "$HERE/scripts/build-rasterizer.sh" || return 1
     fi
 
     if [ "$need_u2net" = 1 ]; then

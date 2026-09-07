@@ -1,6 +1,6 @@
 ---
 name: create-3d-model
-description: Create an untextured 3D model (GLB, and STL for printing) from a text prompt or a concept image, fully locally, using the hy3d-gen MCP server. Use when the user wants a 3D model, asset, mesh, GLB or printable STL of something they describe or have a picture of.
+description: Create a 3D model (GLB, optionally textured, and STL for printing) from a text prompt or a concept image, fully locally, using the hy3d-gen MCP server. Use when the user wants a 3D model, asset, mesh, GLB or printable STL of something they describe or have a picture of.
 ---
 
 # Create a 3D model from a prompt or image
@@ -10,17 +10,29 @@ image-to-3D via Hunyuan3D-2 on CUDA. The pipeline is concept image → RGBA
 cutout → shape → GLB. Your job is to get the user from "I want a 3D model
 of X" to a mesh file, with a preview.
 
-**The output has no texture.** There is no paint stage on this build — the
-texture pipeline needs more VRAM than the card has, so `paint_mesh` refuses
-rather than half-running. What you deliver is clean geometry with normals
-and no UVs or material. Tell the user that up front; do not let them expect
-colour and find grey.
+**Texture is opt-in, and worth offering.** By default you deliver clean
+geometry with normals and no UVs or material. `paint=True` on
+`generate_model` adds UVs and a baked albedo for about 85 seconds more, and
+`paint_mesh` does the same to a GLB that already exists. Ask which the user
+wants when it is not obvious: a printable STL has no use for a texture, and
+a Godot asset usually does.
 
-That is less of a loss than it sounds for the usual targets. The shape
-stage resolves silhouette and large form well and does not resolve surface
-relief at any setting, so ornament, panel lines and fabric folds were
-always going to come from maps applied downstream rather than from the
-mesh.
+Two limits to state rather than let them discover. The texture is diffuse
+colour only — no normal, roughness or metallic map. And the front view
+dominates the bake by 10x over the other five cameras, so a colour only the
+back can see may come out differently there; if the user cares about the
+back, generate the shape multiview *and* say that the paint pass still
+works from the front image alone.
+
+Check `paint_ready` in `server_status` before promising a texture. It is a
+soft check — shape generation is unaffected by it — and when it is false it
+names which half is missing, the weights or the compiled rasterizer, each
+with its own fix.
+
+Relief is the thing neither stage gives you. The shape stage resolves
+silhouette and large form well and does not resolve surface relief at any
+setting, and the texture pass paints ornament on rather than cutting it in.
+Panel lines and fabric folds come from maps applied downstream.
 
 ## First use in a session
 
