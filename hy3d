@@ -80,7 +80,7 @@ preflight() {
     out="$("$PY" - <<'PY' 2>&1
 import sys
 from hy3d_mcp.server import _server_status
-# Hard checks gate generation; the soft two degrade a feature and no more.
+# Hard checks gate generation; the soft ones degrade a feature and no more.
 HARD = ("engine_repo_ok", "engine_venv_ok", "cuda_ok", "driver_ok",
         "weights_cached", "venv_ok")
 s = _server_status()

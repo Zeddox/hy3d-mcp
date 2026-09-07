@@ -5,9 +5,10 @@ engine_cli.py under the engine venv (torch + CUDA), image and mesh work
 shells out to the worker venv (HY3D_PY) via the scripts in workers/. Tools
 return file paths, never blobs.
 
-Shape-only. The paint stage wants more VRAM than a consumer 8GB card has,
-so this server produces untextured geometry and says so rather than
-half-running a texture pass; materials are the caller's job downstream.
+Shape by default, texture on request. The paint stage fits an 8GB card at a
+1024 bake -- see docs/paint-spike-2026-09-06.md for the measurements and the
+four repairs it needed -- and adds about 85 seconds. It produces diffuse
+colour only; normal and roughness maps remain the caller's job downstream.
 
 Config (env, with defaults):
   HY3D_ENGINE_REPO  Hunyuan3D-2 checkout   (~/git/repos/Hunyuan3D-2)
@@ -90,8 +91,10 @@ mcp = FastMCP(
     "hy3d-gen",
     instructions=(
         "Local image-to-3D generation (Hunyuan3D-2 on CUDA). Produces "
-        "UNTEXTURED geometry — there is no texture stage on this build, so "
-        "do not promise the user a painted model. Feed NATURALLY LIT "
+        "untextured geometry by default; paint=True on generate_model, or "
+        "paint_mesh on an existing GLB, bakes a diffuse albedo and costs "
+        "about 85 seconds. There is no normal or roughness map either way. "
+        "Feed NATURALLY LIT "
         "concept art of a single object on a plain background, no drop "
         "shadows. Models land as file paths; importing them into an engine "
         "is the caller's job, and export_stl converts one for printing. "
@@ -347,14 +350,16 @@ async def generate_model(
     model: str | None = None,
     cpu_offload: bool = False,
     paint: bool = False,
+    texture_size: int = 1024,
     ctx: Context | None = None,
 ) -> dict:
-    """Turn a concept image into an UNTEXTURED 3D model (GLB).
+    """Turn a concept image into a 3D model (GLB), optionally textured.
 
-    There is no texture stage on this build — the paint pipeline wants more
-    VRAM than the card has — so the result is clean geometry with normals
-    and no UVs or material. Say that to the user rather than letting them
-    expect colour; passing paint=True is an error, not a slow path.
+    Defaults to shape only: clean geometry with normals, no UVs or material.
+    Pass paint=True to append the texture stage, which adds UVs and a baked
+    albedo — roughly 85 extra seconds, and the result is what Godot can use
+    without a trip through Blender. The texture is diffuse colour only; it
+    carries no normal or roughness map.
 
     What the shape stage does and does not give you: it resolves silhouette
     and large forms faithfully, and it does not resolve surface relief.
@@ -365,6 +370,11 @@ async def generate_model(
 
     auto_cutout keys out a plain background first unless the input already
     carries real transparency. Leave it on.
+    texture_size (1024) is the paint stage's render and bake resolution, and
+    1024 is the ceiling on an 8GB card rather than a cautious default —
+    upstream's 2048 is four times the buffer area across six camera views and
+    spills into host RAM. Ignored unless paint=True.
+
     max_faces decimates the raw output (typically 600k–1M faces, which is
     not something to hand an engine) down to a game-ready budget; 0 keeps
     the raw mesh. Decimation preserves watertightness.
@@ -433,12 +443,8 @@ async def generate_model(
         if given:
             views[tag] = readable(given, "%s view" % tag)
     multiview = len(views) > 1
-    if paint:
-        raise ValueError(
-            "this build has no texture stage: Hunyuan3D's paint pipeline "
-            "needs more VRAM than this card has, so the server generates "
-            "shape only. Call with paint=False (the default) and texture "
-            "the GLB downstream.")
+    if paint and texture_size < 64:
+        raise ValueError("texture_size must be at least 64")
     for name, val in (("octree", octree), ("steps", steps)):
         if val is not None and val < 1:
             raise ValueError("%s must be a positive integer" % name)
@@ -531,6 +537,8 @@ async def generate_model(
                 cmd += ["--octree-resolution", str(octree)]
             if cpu_offload:
                 cmd.append("--cpu-offload")
+            if paint:
+                cmd += ["--paint", "--texture-size", str(texture_size)]
             rc, so, se, streamed = await _run_engine(cmd, os.environ.copy(), ctx)
             if rc != 0 or not dst.is_file():
                 _record_job("generate_model", src.name, False,
@@ -553,6 +561,9 @@ async def generate_model(
                     and stats["faces"] < stats["raw_faces"]:
                 stages.append("decimate (%d -> %d)"
                               % (stats["raw_faces"], stats["faces"]))
+            if stats.get("textured"):
+                stages.append("paint (%d, %ss)"
+                              % (texture_size, stats.get("paint_s")))
     finally:
         with _queue_guard:
             _queue_depth -= 1
@@ -568,7 +579,7 @@ async def generate_model(
            "seconds": round(seconds, 1), "stages": stages,
            "views": list(views) if multiview else None,
            "model": (stats.get("settings") or {}).get("model"),
-           "textured": False,
+           "textured": bool(stats.get("textured")),
            "progress": "streamed" if streamed else "unavailable"}
     if stats.get("warning") or warning:
         out["warning"] = stats.get("warning") or warning
@@ -576,23 +587,88 @@ async def generate_model(
 
 
 @mcp.tool
-def paint_mesh(mesh_path: str, image_path: str,
-               output_path: str | None = None) -> dict:
-    """Unavailable on this build — texturing needs more VRAM than the card has.
+async def paint_mesh(mesh_path: str, image_path: str,
+                     output_path: str | None = None,
+                     texture_size: int = 1024,
+                     ctx: Context | None = None) -> dict:
+    """Texture an existing mesh from a concept image. Roughly 85 seconds.
 
-    Kept as a tool so the failure is a sentence rather than an unknown-tool
-    error: Hunyuan3D's paint pipeline runs multiview diffusion at a peak
-    well past a consumer 8GB card, and the WSL2 failure mode is not a clean
-    OOM but a silent spill into host RAM that runs at PCIe bandwidth. Half
-    of it would appear to work and take an hour.
+    The paint stage on its own, for a GLB that already exists — one generated
+    earlier, or one from anywhere else. It unwraps UVs, renders the mesh from
+    six cameras, runs multiview diffusion conditioned on the image, and bakes
+    the result into a single albedo texture. Output is a new GLB; the input is
+    not modified.
 
-    Texture the GLB downstream instead — Blender, Substance, or Godot's own
-    material tools — or run the paint stage on a larger GPU.
+    image_path is the concept the texture is drawn from, and it should be the
+    same subject as the mesh — this is not a style transfer. A front view
+    dominates the bake by 10x over the other five cameras, so the side the
+    image shows is the side that comes out right.
+
+    What you get is diffuse colour and nothing else: no normal, roughness or
+    metallic map. Cross-view agreement is the known weakness — a colour the
+    front camera cannot see may be resolved differently behind.
+
+    texture_size (1024) is the ceiling on an 8GB card, not a cautious default.
+    Upstream's 2048 is four times the buffer area across six views and spills
+    into host RAM, where it finishes rather than failing, an hour later.
+
+    Blocks on the same machine-wide queue as generate_model.
     """
-    raise RuntimeError(
-        "paint_mesh is unavailable: this server generates shape only. The "
-        "GLB has normals but no UVs or material; texture it downstream, or "
-        "run Hunyuan3D's paint pipeline on a GPU with more VRAM.")
+    global _queue_depth
+    mesh = Path(mesh_path).expanduser().resolve()
+    if not mesh.is_file():
+        raise ValueError("mesh not found: %s" % mesh)
+    if mesh.suffix.lower() not in (".glb", ".gltf", ".obj", ".ply", ".stl"):
+        raise ValueError("unsupported mesh type %r — expected a GLB, glTF, "
+                         "OBJ, PLY or STL" % mesh.suffix)
+    src = Path(image_path).expanduser().resolve()
+    if not src.is_file():
+        raise ValueError("image not found: %s" % src)
+    try:
+        with Image.open(src) as im:
+            im.verify()
+    except Exception as e:
+        raise ValueError("%s is not a readable image: %s" % (src, e))
+    if texture_size < 64:
+        raise ValueError("texture_size must be at least 64")
+
+    dst = _out_path(mesh.stem + "-textured", ".glb", output_path)
+    if dst == mesh:
+        raise ValueError("output would overwrite the input mesh: %s" % dst)
+    started = time.monotonic()
+    with _queue_guard:
+        _queue_depth += 1
+    try:
+        async with _job_lock, _machine_job_lock(ctx):
+            cmd = [str(ENGINE_PY), str(ENGINE_CLI), str(src),
+                   "-o", str(dst), "--paint-mesh", str(mesh),
+                   "--texture-size", str(texture_size),
+                   "--engine", str(ENGINE_REPO)]
+            rc, so, se, streamed = await _run_engine(cmd, os.environ.copy(), ctx)
+            if rc != 0 or not dst.is_file():
+                _record_job("paint_mesh", mesh.name, False,
+                            time.monotonic() - started)
+                raise RuntimeError("painting failed (exit %d):\n%s"
+                                   % (rc, (se or so)[-2000:]))
+            stats = _engine_json(so) or {}
+    finally:
+        with _queue_guard:
+            _queue_depth -= 1
+
+    seconds = time.monotonic() - started
+    _record_job("paint_mesh", mesh.name, True, seconds)
+    out = {"glb_path": str(dst), "source_mesh": str(mesh),
+           "verts": stats.get("vertices"), "faces": stats.get("faces"),
+           "attributes": stats.get("glb_attributes"),
+           "textured": bool(stats.get("textured")),
+           "texture_size": texture_size,
+           "peak_reserved_gib": stats.get("peak_torch_reserved_gib"),
+           "vram_ceiling_gib": stats.get("free_at_baseline_gib"),
+           "seconds": round(seconds, 1),
+           "progress": "streamed" if streamed else "unavailable"}
+    if stats.get("warning"):
+        out["warning"] = stats["warning"]
+    return out
 
 
 @mcp.tool
@@ -783,8 +859,8 @@ def render_preview(glb_path: str, views: list[str] | None = None,
         if not sheets:
             raise RuntimeError(
                 "%s — and no generator sheets beside %s to fall back on "
-                "(only the paint pass writes those, so shape-only output has "
-                "none)" % (e, src.name))
+                "(only the paint pass writes those, and only when it runs "
+                "under upstream's own demo)" % (e, src.name))
         out = {"png_paths": [str(p) for p in sheets],
                "source": "generator_sheets",
                "note": "could not rasterise (%s); these are the multiview and "
@@ -827,6 +903,15 @@ def _server_status() -> dict:
     probe = _probe(ENGINE_PY,
                    "import torch, trimesh, pygltflib, skimage, pymeshlab, rembg\n"
                    "print('CORE_OK')\n"
+                   # The paint stage's one hard dependency, and the only part
+                   # of this server that needs a compiler. mesh_render.py has
+                   # a single rasterizer branch, so without it painting is not
+                   # slow, it is impossible.
+                   "try:\n"
+                   "    import custom_rasterizer, xatlas\n"
+                   "    print('PAINT_DEPS_OK')\n"
+                   "except ImportError as e:\n"
+                   "    print('PAINT_DEPS', e.name)\n"
                    "print('CUDA', torch.cuda.is_available(), torch.version.cuda)\n"
                    "if torch.cuda.is_available():\n"
                    "    f, t = torch.cuda.mem_get_info()\n"
@@ -914,6 +999,34 @@ def _server_status() -> dict:
     if mv_found is not None:
         mv_weights["path"] = str(mv_found.parent)
 
+    # Soft too, and for the same reason: shape generation is complete without
+    # any of it. Painting needs both halves -- the compiled rasterizer and
+    # ~10.4GB of weights -- so report whichever is missing rather than a bare
+    # false, since the two have entirely different fixes.
+    paint_dir = models / "tencent/Hunyuan3D-2"
+    paint_files = [paint_dir / "hunyuan3d-delight-v2-0/unet/diffusion_pytorch_model.safetensors",
+                   paint_dir / "hunyuan3d-paint-v2-0-turbo/unet/diffusion_pytorch_model.bin",
+                   paint_dir / "hunyuan3d-paint-v2-0-turbo/text_encoder/model.safetensors"]
+    have_paint_weights = all(f.is_file() for f in paint_files)
+    rasterizer_line = next((l for l in (probe.stdout.splitlines() if probe else [])
+                            if l.startswith("PAINT_DEPS")), "")
+    have_rasterizer = rasterizer_line == "PAINT_DEPS_OK"
+    missing = []
+    if not have_rasterizer:
+        missing.append(
+            "the %s extension is not importable in the engine venv (build it "
+            "with `scripts/build-rasterizer.sh`; note that rebuilding the "
+            "engine venv discards it)"
+            % (rasterizer_line.split(" ", 1)[-1] if " " in rasterizer_line
+               else "custom_rasterizer"))
+    if not have_paint_weights:
+        missing.append("the paint weights are not under %s (~10.4GB; fetch "
+                       "and prepare them with `bash install.sh --with-paint`)"
+                       % paint_dir)
+    paint_ready = _check(not missing, "texturing is unavailable: %s. Shape "
+                                      "generation does not need either and is "
+                                      "unaffected." % "; and ".join(missing))
+
     venv_ok = False
     venv_fix = ("worker venv missing: run `bash install.sh`, "
                 "or set HY3D_PY to a python with cv2/numpy/trimesh/PIL/scipy/"
@@ -978,6 +1091,7 @@ def _server_status() -> dict:
         "engine_repo_ok": repo, "engine_venv_ok": _check(engine_ok, engine_fix),
         "cuda_ok": cuda, "driver_ok": driver, "weights_cached": weights,
         "mv_weights_cached": mv_weights,
+        "paint_ready": paint_ready,
         "cutout_weights_cached": cutout_weights,
         "venv_ok": _check(venv_ok, venv_fix),
         "preview_ok": _check(preview_ok, preview_fix),
