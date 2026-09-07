@@ -4,9 +4,9 @@ Runs as a subprocess of the MCP server, never imported by it: the engine
 venv carries torch/CUDA and the server venv does not, so the only thing
 crossing between them is argv and stdout.
 
-Shape-only, by design rather than by omission. The paint stage wants more
-VRAM than an 8GB card has, so this emits an untextured GLB and leaves
-material work to the caller's DCC or engine.
+Shape by default, texture on request. `--paint` runs Hunyuan3D's paint
+pipeline over the generated mesh and emits a GLB with UVs and a baked albedo;
+`--paint-mesh` skips generation and paints a mesh that already exists.
 
 Two output contracts the server depends on:
 
@@ -37,6 +37,17 @@ GIB = 1024 ** 3
 # octree 384 on a 3060 Ti: ~36s diffusion against ~84s decode.
 P_LOADED, P_DIFFUSION_END, P_DECODE_END = 8.0, 40.0, 95.0
 
+# With a texture pass appended, shape gets squeezed into the front of the bar
+# and paint owns the rest. Painting is ~65s against shape's ~115s, so the
+# split is not even: P_SHAPE_END is where the shape stage's 95% lands.
+P_SHAPE_END = 60.0
+
+# Upstream defaults to 2048, which is 4x the buffer area across six camera
+# views and does not fit on an 8GB card -- see docs/paint-spike-2026-09-06.md.
+# 1024 measured 6.76 GiB peak against a 6.96 GiB ceiling at 40k faces.
+DEFAULT_TEXTURE_SIZE = 1024
+PAINT_SUB = "hunyuan3d-paint-v2-0-turbo"
+
 # Which dit subfolder belongs to which repo. The pair has to move together:
 # only one of the three names its subfolder after itself, and a mismatched
 # pair is not a loud failure -- smart_load_model simply reports a path that
@@ -50,9 +61,16 @@ DEFAULT_MODEL = "tencent/Hunyuan3D-2"
 MV_MODEL = "tencent/Hunyuan3D-2mv"
 
 
+# What fraction of the bar the current stage owns. The shape stage reports
+# 0-100 whether or not it is the whole run, so appending a paint pass is a
+# matter of rescaling here rather than threading a span through every emit.
+SCALE = {"base": 0.0, "span": 100.0}
+
+
 def emit(pct, message):
     """One progress line in the form the server's parser expects."""
-    print("[%3d%%] %s" % (int(pct), message), flush=True)
+    print("[%3d%%] %s" % (int(SCALE["base"] + pct * SCALE["span"] / 100.0),
+                          message), flush=True)
 
 
 def nvidia_smi_used():
@@ -93,6 +111,50 @@ def glb_attributes(path):
         return ["<unreadable: %s>" % e]
 
 
+def run_paint(mesh, image, texture_size):
+    """Texture a mesh in place of its bare geometry. Returns (mesh, load_s, paint_s).
+
+    The caller must have dropped every reference to the shape pipeline before
+    calling this -- see the teardown in main().
+    """
+    import gc
+    import torch
+
+    gc.collect()
+    torch.cuda.empty_cache()
+
+    # diffusers >= 0.34 gates any custom_pipeline behind trust_remote_code, and
+    # upstream predates the gate. The code being trusted is the file in the
+    # engine checkout this process already imported from, not a hub download.
+    from diffusers import DiffusionPipeline
+    original = DiffusionPipeline.from_pretrained.__func__
+    DiffusionPipeline.from_pretrained = classmethod(
+        lambda cls, *a, **kw: original(cls, *a, **{"trust_remote_code": True, **kw}))
+
+    from hy3dgen.texgen import Hunyuan3DPaintPipeline
+
+    emit(2, "loading the paint pipeline")
+    t = time.time()
+    pipe = Hunyuan3DPaintPipeline.from_pretrained(DEFAULT_MODEL, subfolder=PAINT_SUB)
+    # render_size is read at call time, but MeshRender takes its resolutions at
+    # construction -- so setting the config alone would leave the renderer at
+    # 2048 and silently disagree with the images fed into it.
+    pipe.config.render_size = pipe.config.texture_size = texture_size
+    pipe.render.set_default_render_resolution(texture_size)
+    pipe.render.set_default_texture_resolution(texture_size)
+    # Not a lever: the delight and multiview pipelines are ~7.4 GiB of fp16
+    # weights between them, more than the card holds before a single activation.
+    pipe.enable_model_cpu_offload()
+    load_s = time.time() - t
+
+    emit(20, "painting at %d (six views)" % texture_size)
+    t = time.time()
+    painted = pipe(mesh, image)
+    paint_s = time.time() - t
+    emit(95, "painted in %.0fs" % paint_s)
+    return painted, round(load_s, 1), round(paint_s, 1)
+
+
 def main():
     ap = argparse.ArgumentParser(description=__doc__)
     ap.add_argument("image", help="the front view, and the only required one")
@@ -108,6 +170,17 @@ def main():
     for tag in ("left", "back", "right"):
         ap.add_argument("--view-" + tag, metavar="IMAGE",
                         help="the %s view (multiview run)" % tag)
+    ap.add_argument("--paint", action="store_true",
+                    help="run the texture pass over the generated mesh; the "
+                         "output then carries UVs and a baked albedo")
+    ap.add_argument("--paint-mesh", metavar="GLB",
+                    help="paint this existing mesh instead of generating one. "
+                         "The positional image is still required -- it is the "
+                         "concept the texture is drawn from.")
+    ap.add_argument("--texture-size", type=int, default=DEFAULT_TEXTURE_SIZE,
+                    help="render and texture resolution for the paint pass "
+                         "(default %d; upstream's 2048 does not fit in 8GB)"
+                         % DEFAULT_TEXTURE_SIZE)
     ap.add_argument("--steps", type=int, default=50)
     ap.add_argument("--guidance-scale", type=float, default=5.0)
     ap.add_argument("--octree-resolution", type=int, default=384)
@@ -130,7 +203,10 @@ def main():
     sys.path.insert(0, args.engine)
     import torch
     from PIL import Image
-    from hy3dgen.shapegen import Hunyuan3DDiTFlowMatchingPipeline
+
+    painting = bool(args.paint or args.paint_mesh)
+    if painting:
+        SCALE["span"] = P_SHAPE_END
 
     if not torch.cuda.is_available():
         sys.exit("CUDA unavailable -- check /usr/lib/wsl/lib is on the loader path")
@@ -177,95 +253,124 @@ def main():
     # run hands over the bare image, because the plain v2 processor takes one.
     image = images if multiview else images["front"]
 
-    model = args.model or (MV_MODEL if multiview else DEFAULT_MODEL)
-    if multiview and model != MV_MODEL:
-        # Switching under a caller who named a model is worth doing and worth
-        # saying: the other two repos ship a single-image conditioner, so their
-        # only way to honour four views is to ignore three of them.
-        print("[model] %s has no multiview conditioner -- using %s instead"
-              % (model, MV_MODEL))
-        model = MV_MODEL
-    subfolder = args.subfolder or DITS.get(model, "hunyuan3d-dit-v2-0")
-    print("[model] %s / %s%s"
-          % (model, subfolder,
-             "  views: " + ",".join(images) if multiview else ""))
-    emit(2, "loading %s" % model)
-    t = time.time()
-    # A "missing keys" warning for the VAE encoder is expected and benign:
-    # the bundled checkpoint ships a decoder-only VAE and loads strict=False.
-    pipe = Hunyuan3DDiTFlowMatchingPipeline.from_pretrained(
-        model, subfolder=subfolder, use_safetensors=True, variant="fp16")
-    if args.flashvdm:
-        pipe.enable_flashvdm()
-    if args.cpu_offload:
-        # Upstream's enable_model_cpu_offload() and _execution_device were
-        # lifted from diffusers' DiffusionPipeline without the base class that
-        # provides `.components`, so both raise AttributeError as shipped.
-        # Supply the mapping ourselves; the keys must match the names in
-        # model_cpu_offload_seq ("conditioner->model->vae").
-        if not hasattr(type(pipe), "components"):
-            type(pipe).components = property(lambda self: {
-                "conditioner": self.conditioner,
-                "model": self.model,
-                "vae": self.vae,
-            })
-        pipe.enable_model_cpu_offload()
-        # Second half of the same incomplete lift: enable_model_cpu_offload()
-        # moves the pipeline to CPU, and __call__ then reads `self.device` --
-        # a plain attribute, now "cpu" -- to place latents and timesteps. The
-        # hooked modules still execute on the GPU, so the sampler dies with
-        # "found at least two devices, cuda:0 and cpu". `_execution_device`
-        # exists for exactly this and is never used; restore the attribute.
-        pipe.device = torch.device("cuda")
-    load_s = time.time() - t
-    after_load = (free0 - torch.cuda.mem_get_info()[0]) / GIB
-    emit(P_LOADED, "loaded in %.0fs, %.2f GiB resident" % (load_s, after_load))
-
-    # The denoising loop is the only part of pipe() that can report from the
-    # inside. Volume decoding runs after it, still inside the same call, so
-    # the last step hands the bar over to the heartbeat at P_DIFFUSION_END
-    # and the decode's own tqdm goes to stderr where nothing parses it.
-    span = P_DIFFUSION_END - P_LOADED
-    done = {"n": 0}
-
-    def on_step(step_idx, t_, outputs):
-        # `outputs` holds scheduler tensors; touching it here would cost a
-        # device sync per step for nothing. Count invocations instead --
-        # step_idx is divided by the scheduler order and need not be dense.
-        done["n"] += 1
-        n = done["n"]
-        emit(P_LOADED + span * min(n / max(args.steps, 1), 1.0),
-             "diffusion step %d/%d" % (n, args.steps))
-        if n >= args.steps:
-            emit(P_DIFFUSION_END,
-                 "decoding volume at octree %d" % args.octree_resolution)
-
-    torch.cuda.reset_peak_memory_stats()
-    t = time.time()
-    mesh = pipe(
-        image=image,
-        num_inference_steps=args.steps,
-        guidance_scale=args.guidance_scale,
-        octree_resolution=args.octree_resolution,
-        generator=torch.manual_seed(args.seed),
-        callback=on_step,
-        # Required, not merely advisory: the loop evaluates `i %
-        # callback_steps` whenever a callback is set, and the default None
-        # makes that a TypeError on the first step.
-        callback_steps=1,
-    )[0]
-    gen_s = time.time() - t
-
-    raw_faces = int(len(mesh.faces))
-    reduce_s = None
-    if args.max_faces and raw_faces > args.max_faces:
-        from hy3dgen.shapegen import FaceReducer, FloaterRemover
-        emit(P_DECODE_END, "decimating %d -> %d faces" % (raw_faces, args.max_faces))
-        t = time.time()
-        mesh = FaceReducer()(FloaterRemover()(mesh), max_facenum=args.max_faces)
-        reduce_s = round(time.time() - t, 1)
+    if args.paint_mesh:
+        # Painting a mesh someone else made: no shape pipeline, no diffusion,
+        # and the stats below have nothing to report for either.
+        import trimesh
+        model = subfolder = shape_pipe = None
+        load_s = gen_s = None
+        reduce_s = None
+        emit(50, "loading %s" % Path(args.paint_mesh).name)
+        mesh = trimesh.load(args.paint_mesh, force="mesh")
+        raw_faces = int(len(mesh.faces))
+        emit(100, "%d faces" % raw_faces)
     else:
-        emit(P_DECODE_END, "%d faces" % raw_faces)
+        from hy3dgen.shapegen import Hunyuan3DDiTFlowMatchingPipeline
+
+        model = args.model or (MV_MODEL if multiview else DEFAULT_MODEL)
+        if multiview and model != MV_MODEL:
+            # Switching under a caller who named a model is worth doing and worth
+            # saying: the other two repos ship a single-image conditioner, so their
+            # only way to honour four views is to ignore three of them.
+            print("[model] %s has no multiview conditioner -- using %s instead"
+                  % (model, MV_MODEL))
+            model = MV_MODEL
+        subfolder = args.subfolder or DITS.get(model, "hunyuan3d-dit-v2-0")
+        print("[model] %s / %s%s"
+              % (model, subfolder,
+                 "  views: " + ",".join(images) if multiview else ""))
+        emit(2, "loading %s" % model)
+        t = time.time()
+        # A "missing keys" warning for the VAE encoder is expected and benign:
+        # the bundled checkpoint ships a decoder-only VAE and loads strict=False.
+        pipe = shape_pipe = Hunyuan3DDiTFlowMatchingPipeline.from_pretrained(
+            model, subfolder=subfolder, use_safetensors=True, variant="fp16")
+        if args.flashvdm:
+            pipe.enable_flashvdm()
+        if args.cpu_offload:
+            # Upstream's enable_model_cpu_offload() and _execution_device were
+            # lifted from diffusers' DiffusionPipeline without the base class that
+            # provides `.components`, so both raise AttributeError as shipped.
+            # Supply the mapping ourselves; the keys must match the names in
+            # model_cpu_offload_seq ("conditioner->model->vae").
+            if not hasattr(type(pipe), "components"):
+                type(pipe).components = property(lambda self: {
+                    "conditioner": self.conditioner,
+                    "model": self.model,
+                    "vae": self.vae,
+                })
+            pipe.enable_model_cpu_offload()
+            # Second half of the same incomplete lift: enable_model_cpu_offload()
+            # moves the pipeline to CPU, and __call__ then reads `self.device` --
+            # a plain attribute, now "cpu" -- to place latents and timesteps. The
+            # hooked modules still execute on the GPU, so the sampler dies with
+            # "found at least two devices, cuda:0 and cpu". `_execution_device`
+            # exists for exactly this and is never used; restore the attribute.
+            pipe.device = torch.device("cuda")
+        load_s = time.time() - t
+        after_load = (free0 - torch.cuda.mem_get_info()[0]) / GIB
+        emit(P_LOADED, "loaded in %.0fs, %.2f GiB resident" % (load_s, after_load))
+
+        # The denoising loop is the only part of pipe() that can report from the
+        # inside. Volume decoding runs after it, still inside the same call, so
+        # the last step hands the bar over to the heartbeat at P_DIFFUSION_END
+        # and the decode's own tqdm goes to stderr where nothing parses it.
+        span = P_DIFFUSION_END - P_LOADED
+        done = {"n": 0}
+
+        def on_step(step_idx, t_, outputs):
+            # `outputs` holds scheduler tensors; touching it here would cost a
+            # device sync per step for nothing. Count invocations instead --
+            # step_idx is divided by the scheduler order and need not be dense.
+            done["n"] += 1
+            n = done["n"]
+            emit(P_LOADED + span * min(n / max(args.steps, 1), 1.0),
+                 "diffusion step %d/%d" % (n, args.steps))
+            if n >= args.steps:
+                emit(P_DIFFUSION_END,
+                     "decoding volume at octree %d" % args.octree_resolution)
+
+        torch.cuda.reset_peak_memory_stats()
+        t = time.time()
+        mesh = pipe(
+            image=image,
+            num_inference_steps=args.steps,
+            guidance_scale=args.guidance_scale,
+            octree_resolution=args.octree_resolution,
+            generator=torch.manual_seed(args.seed),
+            callback=on_step,
+            # Required, not merely advisory: the loop evaluates `i %
+            # callback_steps` whenever a callback is set, and the default None
+            # makes that a TypeError on the first step.
+            callback_steps=1,
+        )[0]
+        gen_s = time.time() - t
+
+        raw_faces = int(len(mesh.faces))
+        reduce_s = None
+        if args.max_faces and raw_faces > args.max_faces:
+            from hy3dgen.shapegen import FaceReducer, FloaterRemover
+            emit(P_DECODE_END, "decimating %d -> %d faces" % (raw_faces, args.max_faces))
+            t = time.time()
+            mesh = FaceReducer()(FloaterRemover()(mesh), max_facenum=args.max_faces)
+            reduce_s = round(time.time() - t, 1)
+        else:
+            emit(P_DECODE_END, "%d faces" % raw_faces)
+
+    paint_s = paint_load_s = None
+    if painting:
+        SCALE["base"], SCALE["span"] = P_SHAPE_END, 100.0 - P_SHAPE_END
+        # Surrender the shape pipeline before the paint models load. Not
+        # tidiness: the caching allocator is still holding ~6 GiB of shape
+        # blocks, and paint wants 6.8 GiB of its own. Measured on a 3060 Ti,
+        # painting without this teardown took 157s and reserved 11.57 GiB
+        # against a 6.96 GiB ceiling -- a spill rather than an error, because
+        # WDDM serves the overflow from host RAM. With it: 63s and 6.76 GiB,
+        # matching a cold run. Both names have to go; dropping one inside the
+        # callee leaves the other holding every block.
+        pipe = shape_pipe = None
+        mesh, paint_load_s, paint_s = run_paint(
+            mesh, images["front"], args.texture_size)
 
     peak = torch.cuda.max_memory_allocated() / GIB
     # Reserved, not resident, is the spill signal. Resident includes blocks the
@@ -283,6 +388,14 @@ def main():
     # POSITION-only file; Godot does not synthesize normals and lights such a
     # mesh off one constant vector, which reads as a broken material rather
     # than a missing attribute.
+    if painting:
+        # trimesh's PBR default is metallicFactor 1.0, which renders a baked
+        # albedo as near-black in Godot until an environment map saves it. The
+        # texture the paint pass produces is diffuse colour, so say so.
+        material = getattr(mesh.visual, "material", None)
+        if material is not None:
+            material.metallicFactor = 0.0
+            material.roughnessFactor = 1.0
     mesh.export(str(out), include_normals=True)
     emit(100, "wrote %s" % out.name)
 
@@ -301,9 +414,12 @@ def main():
         "multiview": multiview,
         "views": list(images),
         "glb_attributes": glb_attributes(out),
-        "load_s": round(load_s, 1),
-        "generate_s": round(gen_s, 1),
+        "textured": painting,
+        "load_s": round(load_s, 1) if load_s is not None else None,
+        "generate_s": round(gen_s, 1) if gen_s is not None else None,
         "reduce_s": reduce_s,
+        "paint_load_s": paint_load_s,
+        "paint_s": paint_s,
         "peak_torch_alloc_gib": round(peak, 2),
         "peak_torch_reserved_gib": round(reserved, 2),
         "resident_after_gib": round(resident, 2),
@@ -312,7 +428,8 @@ def main():
         "settings": {"model": model, "steps": args.steps,
                      "octree_resolution": args.octree_resolution,
                      "guidance_scale": args.guidance_scale, "seed": args.seed,
-                     "cpu_offload": args.cpu_offload, "flashvdm": args.flashvdm},
+                     "cpu_offload": args.cpu_offload, "flashvdm": args.flashvdm,
+                     "texture_size": args.texture_size if painting else None},
     }
     if spilled:
         stats["warning"] = (
