@@ -172,6 +172,29 @@ it.
 Plan for ornament to come from normal or displacement maps in the texture
 step, not from geometry.
 
+### The border rule, end to end
+
+The corner key's component filter (0.11.1) was measured on the mesh, not
+just the PNGs. Same four views, same seed 42, `max_faces 0`, before and
+after:
+
+| | before | after |
+|---|---|---|
+| faces | 737,216 | 681,944 |
+| volume at 240mm | 346.4 cm3 | 442.0 cm3 |
+| checks | not watertight, 4 bodies | watertight, single body |
+| `printable` | false | true |
+| peak torch reserved | — | 6.65 GiB of 6.96 |
+| wall clock | — | 226.5s |
+
+The slab is gone from the side render. The volume went *up* by a quarter
+because the figure had been flattened against the slab it was fused to, not
+merely accompanied by it — which is the argument for fixing this at the
+cutout rather than anywhere downstream. Genus rose 50 -> 87 over the same
+subject, and that is expected: the sword is now clear of the leg and the
+cloak fringe separates into strands, so there are more loops for the
+reconstruction to close. It still slices.
+
 Decimation is not optional for a game target: raw output is 0.6-1.0M faces.
 For 3D printing, prefer a higher budget or the undecimated mesh — 40k faces is
 a game budget, and quadric decimation is tuned to preserve silhouette, not the
