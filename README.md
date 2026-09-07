@@ -248,9 +248,10 @@ the mesh is watertight, euler 2, one body, no broken faces; nothing about
 the surface changed. `export_stl` does that merge before it checks or
 writes, so a painted model still prints: on the same mesh it reports the
 identical volume, bbox fill and `printable: true` as the untextured
-original. The stat this server reports is measured on a merged copy for
-the same reason; a third-party tool reading the GLB directly will say
-non-watertight.
+original. On a painted run the stat this server reports is measured on a
+merged copy for the same reason; a third-party tool reading the GLB
+directly will say non-watertight. Shape-only output is unaffected — it has
+no UVs to split, so nothing there changed.
 
 **`texture_size` 1024 is a ceiling, not a cautious default.** Upstream bakes
 at 2048, which is four times the buffer area across six cameras and

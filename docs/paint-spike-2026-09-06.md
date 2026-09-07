@@ -122,7 +122,10 @@ Two places had to act on that:
   fill, `printable: true`.
 * `engine_cli` measures the stat on a merged **copy**, so the number
   describes the geometry. The copy is thrown away — merging in place keeps
-  one arbitrary UV per position and breaks the texture.
+  one arbitrary UV per position and breaks the texture. Gated on the paint
+  flag: shape-only output has no seams to merge, so running the probe there
+  could only be a no-op or a new way for the default path to fail after it
+  had already written a good GLB.
 
 ## The material fix that was not applied
 
@@ -142,10 +145,18 @@ back out of the written file, so the claim is measured rather than asserted.
 ## Chaining
 
 `finish_model` now has something to chain onto — painted output is the first
-textured GLB this server produces. Verified on the viking: attributes and
-base colour survive the round trip, and the pass sets metallic 0 / roughness
-1 itself. `accent_coverage_pct` came back 0.0, which is the extractor's
-range (it keys on broad saturated red-dominant panels) rather than a fault.
+textured GLB this server produces. Verified on the viking, through the tool
+rather than the worker: attributes, base colour and the emissive accent map
+all survive, and the pass sets metallic 0 / roughness 1 itself.
+`accent_coverage_pct` came back 0.0, which is the extractor's range (it keys
+on broad saturated red-dominant panels) rather than a fault.
+
+The tool's normals post-step was the thing worth checking, since it rewrites
+a GLB that `finish.py` has just given an emissive texture. On painted input
+`finish.py` keeps NORMAL, so the step reports `normals_added: false` and
+touches nothing; forcing the other branch by stripping NORMAL first, the
+rewrite preserves both images and the emissive material. Either way the
+accent map survives.
 
 ## Reproducing it
 

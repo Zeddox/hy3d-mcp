@@ -469,8 +469,12 @@ def main():
         # euler 2, one body, no broken faces. Ask a merged copy, so the
         # number describes the geometry rather than the atlas. The copy is
         # thrown away: merging in place would collapse exactly the duplicate
-        # UVs the texture is painted against.
-        "watertight": bool(watertight_probe(mesh).is_watertight),
+        # UVs the texture is painted against. Gated on the paint flag rather
+        # than run unconditionally: shape-only output has no UVs to split, so
+        # the probe there could only be a no-op or a new way for the default
+        # path to fail after it has already written a good GLB.
+        "watertight": bool(watertight_probe(mesh).is_watertight if painting
+                           else mesh.is_watertight),
         "multiview": multiview,
         "views": list(images),
         "glb_attributes": glb_attributes(out),

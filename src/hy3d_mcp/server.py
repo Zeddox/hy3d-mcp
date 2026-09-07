@@ -796,10 +796,11 @@ def finish_model(
     generate_model(paint=True) or paint_mesh first and this chains onto the
     result. On a shape-only GLB it fails -- there is no albedo map to tone.
 
-    Verified on a painted viking: attributes and the base colour texture
-    survive the round trip, and the pass sets metallicFactor 0 /
-    roughnessFactor 1 itself. accent_coverage_pct came back 0.0 there,
-    which is the extractor's range rather than a fault -- see below.
+    Verified on a painted viking, both post-steps included: attributes, the
+    base colour texture and the emissive map all survive, and the pass sets
+    metallicFactor 0 / roughnessFactor 1 itself. accent_coverage_pct came
+    back 0.0 there, which is the extractor's range rather than a fault --
+    see below.
 
     Tones the albedo (gamma/contrast/saturation), extracts saturated accents
     and blackhat panel seams into a dedicated glTF emissive texture.
@@ -830,7 +831,12 @@ def finish_model(
     started = time.monotonic()
     out = _run_worker("finish.py", argv)
     if normals:
-        # After finish.py, not before: its trimesh round-trip drops NORMAL.
+        # After finish.py, not before: its trimesh round-trip can drop
+        # NORMAL. On painted input it happens to keep it, so this reports
+        # normals_added false -- and when it does have to rewrite the file,
+        # the emissive map finish.py just built survives that rewrite. Both
+        # branches checked, because losing the accent map to the pass that
+        # protects the normals would defeat the whole call.
         nrm = _add_normals(dst)
         out["normals_added"] = bool(nrm.get("normals_added"))
         if nrm.get("warning"):
