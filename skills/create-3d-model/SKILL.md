@@ -110,7 +110,8 @@ seconds; a bad generation costs ~3 minutes and still has to be redone.
 `prepare_concept`; what it reports depends on which key ran, and the two
 regimes do not share a diagnostic.
 
-`method: corner` — check the alpha channel of the RGBA it writes. A clean
+`method: corner` (or `corner+component-filter`, when it dropped stray
+islands) — check the alpha channel of the RGBA it writes. A clean
 corner key is almost entirely alpha 0 or 255 with well under 1% in between.
 What that histogram catches is **background non-uniformity**, easy to miss
 by eye: one observed gradient-gray background keyed at 36% partial alpha
@@ -131,6 +132,16 @@ away — and the PNG itself. On a garden scene that drop is exactly right (a
 loose rock became its own island); on a two-part subject it is the second
 part going missing. The `note` field carries the corner key's reason for
 declining, which tells you what about the image was not plain.
+
+A `components_dropped` on the corner path is usually frame furniture: a
+border rule, a caption box, a colour swatch — anything in the frame that is
+a different colour from the corner the key sampled. It survives the key as
+its own island and would otherwise be reconstructed as literal geometry.
+The case that motivated the filter: a multiview sheet cut into strips, where
+three of four strips carried a 1-2px full-height border rule and the mesh
+came back with a vertical slab standing behind the figure. Only islands
+under 5% of the subject are dropped, so a real detached part is safe — but
+if the count is high on a subject you know has separate pieces, open the PNG.
 
 Either way the image is cropped to the subject and padded square before it
 reaches the generator, so a subject that filled a third of the frame is not
@@ -295,6 +306,13 @@ Read the result properly before calling anything printable:
   minutes on knobs.
 - Phantom pancake of geometry under the model → a shadow survived in the
   concept; regenerate with "floating, no shadow".
+- Vertical slab or plane standing beside or behind the model → something
+  in the frame keyed as its own island. Since 0.11.1 the corner key drops
+  those, so check `components_dropped` on the cutout; if the slab is still
+  there it was connected to the subject in the image, and only a
+  regenerated concept removes it. Do not try to cut it out of the mesh —
+  once fused it is not a separate component and the STL island filter
+  cannot see it either.
 - Too heavy for the target engine → lower `max_faces`. Decimation happens
   inside the generation call, on the raw mesh, and preserves
   watertightness. Do not run a separate remesh or repair pass over a

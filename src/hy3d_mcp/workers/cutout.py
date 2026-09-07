@@ -16,6 +16,9 @@ Two keys, tried in order:
    Slower, needs a 176MB weight file, and keeps stray objects the corner
    key would never have reached — hence the largest-component filter.
 
+Both keys then run that component filter, at different thresholds; see
+``largest_component`` for why the corner key needs one at all.
+
 Downstream rationale: Hunyuan3D (and TRELLIS before it) skips its gated
 background-removal model whenever the input already carries real
 transparency, so keying here removes the only gated-weights dependency in
@@ -39,6 +42,12 @@ MARGIN = 32
 CORNER_SPREAD_MAX = 28.0
 # Below this the key has eaten the subject rather than the background.
 OPAQUE_MIN_PCT = 0.5
+# Corner-key islands smaller than this share of the subject are frame
+# furniture, not part of it. Measured across four multiview strips: the
+# border rules ran 0.7-1.4%, and everything else the key found was single
+# pixels. 5% leaves 3.5x headroom over the largest observed stray while
+# staying well under any real detached part.
+CORNER_KEEP_PCT = 5.0
 
 
 def emit(payload: dict) -> None:
@@ -104,14 +113,34 @@ def key_rembg(path: str) -> tuple[np.ndarray, np.ndarray]:
     return arr[..., 3] / 255.0, arr[..., :3]
 
 
-def largest_component(alpha: np.ndarray) -> tuple[np.ndarray, int]:
-    """Keep only the biggest connected blob. Returns (alpha, blobs dropped).
+def largest_component(alpha: np.ndarray,
+                      keep_pct: float | None = None) -> tuple[np.ndarray, int]:
+    """Drop stray islands. Returns (alpha, blobs dropped).
 
     u2net segments *subjects*, plural: on garden concept art it keeps the
     lantern and also a loose rock and part of a cast shadow. Each arrives as
     its own island, and every island becomes geometry — a rock floating
-    beside the model. The corner key never needs this; it cannot reach past
-    the background it sampled.
+    beside the model.
+
+    The corner key needs this too, which the earlier docstring here denied
+    ("it cannot reach past the background it sampled"). It can, whenever
+    something in the frame is a different colour from the corner it sampled
+    and survives the key on its own. The case that proved it: a multiview
+    sheet cut into strips, where three of four strips carried a 1-2px
+    full-height border rule. The rule keyed as its own island, became a
+    vertical slab standing behind the figure, and fused into the mesh — by
+    which point no mesh-side filter can separate it, because it is no
+    longer a separate component.
+
+    Which islands to drop differs by path, so the threshold does too.
+    ``keep_pct=None`` keeps only the biggest blob: that is the rembg
+    contract, where a second *subject* is exactly what should go. A float
+    keeps every blob at least that percentage of the biggest, which is what
+    the corner path wants — its strays are frame furniture, measured at
+    0.7-1.4% of the subject across the four views above, while a genuinely
+    detached second part of a subject is far larger. Erring toward keeping
+    is right here: a kept rule is visible in the preview, a dropped arm is
+    not.
     """
     try:
         from scipy.ndimage import label
@@ -121,9 +150,14 @@ def largest_component(alpha: np.ndarray) -> tuple[np.ndarray, int]:
     if n <= 1:
         return alpha, 0
     # Bin 0 is background, so the subject is the largest of bins 1..n.
-    sizes = np.bincount(lab.ravel())
-    keep = int(np.argmax(sizes[1:])) + 1
-    return np.where(lab == keep, alpha, 0.0).astype(np.float32), n - 1
+    sizes = np.bincount(lab.ravel())[1:]
+    biggest = int(sizes.max())
+    if keep_pct is None:
+        keep = np.array([int(np.argmax(sizes)) + 1])
+    else:
+        keep = np.where(sizes >= biggest * keep_pct / 100.0)[0] + 1
+    mask = np.isin(lab, keep)
+    return np.where(mask, alpha, 0.0).astype(np.float32), n - len(keep)
 
 
 def frame_square(rgb: np.ndarray, alpha: np.ndarray) -> Image.Image:
@@ -161,11 +195,19 @@ def main() -> None:
     alpha = None
     refusal = None
     method = args.method
+    dropped = 0
     if args.method in ("auto", "corner"):
         alpha, refusal = key_corners(rgb)
         method = "corner"
+        if alpha is not None:
+            # See largest_component: the corner key does reach past its own
+            # background, and a border rule it keeps becomes a slab fused
+            # into the mesh. Generous threshold — this is only meant to
+            # catch frame furniture, not to pick between subjects.
+            alpha, dropped = largest_component(alpha, keep_pct=CORNER_KEEP_PCT)
+            if dropped:
+                method = "corner+component-filter"
 
-    dropped = 0
     if alpha is None and args.method in ("auto", "rembg"):
         try:
             alpha, rgb = key_rembg(args.input)
