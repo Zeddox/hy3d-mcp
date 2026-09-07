@@ -575,6 +575,10 @@ async def generate_model(
     _record_job("generate_model", src.name, True, seconds)
     out = {"glb_path": str(dst), "verts": stats.get("vertices"),
            "faces": stats.get("faces"), "raw_faces": stats.get("raw_faces"),
+           # Measured on a positionally merged copy of the mesh. Painting
+           # splits vertices along the UV seams, which makes a closed
+           # surface read as non-watertight; the engine merges before
+           # asking, so this stays a statement about the geometry.
            "watertight": stats.get("watertight"),
            "attributes": stats.get("glb_attributes"),
            "peak_reserved_gib": stats.get("peak_torch_reserved_gib"),
@@ -583,6 +587,11 @@ async def generate_model(
            "views": list(views) if multiview else None,
            "model": (stats.get("settings") or {}).get("model"),
            "textured": bool(stats.get("textured")),
+           # Read back out of the written GLB, not off the mesh object. A
+           # metallicFactor of 1.0 here means the albedo will render
+           # near-black in Godot, and that regression is invisible from
+           # in-memory state -- it has happened once already.
+           "glb_material": stats.get("glb_material"),
            "progress": "streamed" if streamed else "unavailable"}
     if stats.get("warning") or warning:
         out["warning"] = stats.get("warning") or warning
@@ -665,6 +674,7 @@ async def paint_mesh(mesh_path: str, image_path: str,
            "verts": stats.get("vertices"), "faces": stats.get("faces"),
            "attributes": stats.get("glb_attributes"),
            "textured": bool(stats.get("textured")),
+           "glb_material": stats.get("glb_material"),
            "texture_size": texture_size,
            "peak_reserved_gib": stats.get("peak_torch_reserved_gib"),
            "vram_ceiling_gib": stats.get("free_at_baseline_gib"),
@@ -782,10 +792,14 @@ def finish_model(
 ) -> dict:
     """Apply the game-look texture pass to a GLB that already has a texture.
 
-    Not reachable from this server's own output: shape-only generation
-    produces no albedo map for this to tone, so calling it on a fresh
-    generate_model result fails. It stays available for GLBs textured
-    elsewhere and round-tripped back through here.
+    Reachable from this server's own output since 0.10.0: run
+    generate_model(paint=True) or paint_mesh first and this chains onto the
+    result. On a shape-only GLB it fails -- there is no albedo map to tone.
+
+    Verified on a painted viking: attributes and the base colour texture
+    survive the round trip, and the pass sets metallicFactor 0 /
+    roughnessFactor 1 itself. accent_coverage_pct came back 0.0 there,
+    which is the extractor's range rather than a fault -- see below.
 
     Tones the albedo (gamma/contrast/saturation), extracts saturated accents
     and blackhat panel seams into a dedicated glTF emissive texture.

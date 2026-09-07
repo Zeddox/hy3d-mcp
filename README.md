@@ -236,7 +236,21 @@ You get a GLB carrying `TEXCOORD_0` and a baked albedo, which Godot imports
 and lights without a trip through Blender. Diffuse colour only — no normal,
 roughness or metallic map — and the exporter sets `metallicFactor` to 0,
 because trimesh defaults it to 1.0 and an albedo under a metallic material
-renders as near-black.
+renders as near-black. The `glb_material` field reports both factors as
+read back from the written file, not as set on the mesh, because the
+difference is exactly where that bug hides.
+
+**A painted GLB reports `watertight: false`, and the geometry is fine.**
+UV unwrapping splits vertices along every atlas seam — the same 40,000
+faces arrive carrying 24,929 vertices instead of 20,002 — and
+`is_watertight` asks whether faces share vertices. Merge by position and
+the mesh is watertight, euler 2, one body, no broken faces; nothing about
+the surface changed. `export_stl` does that merge before it checks or
+writes, so a painted model still prints: on the same mesh it reports the
+identical volume, bbox fill and `printable: true` as the untextured
+original. The stat this server reports is measured on a merged copy for
+the same reason; a third-party tool reading the GLB directly will say
+non-watertight.
 
 **`texture_size` 1024 is a ceiling, not a cautious default.** Upstream bakes
 at 2048, which is four times the buffer area across six cameras and
@@ -250,8 +264,9 @@ weights `[1, 0.1, 0.5, 0.1, 0.05, 0.05]`, so the front dominates by 10x and
 anything only the back camera sees is resolved on its own. On a test viking
 that showed up as fur pauldrons reading brown in front and grey behind.
 
-Setup is separate from the shape install, because it is another 10.4GB and
-the only part of this project that needs a compiler:
+Setup is separate from the shape install, because it is another 10.4GB
+downloaded (16GB on disk, since each conversion leaves its source beside
+the result) and the only part of this project that needs a compiler:
 
     ./hy3d install --with-paint
 
@@ -327,11 +342,18 @@ concept with no manual prep:
 
 With `paint=True`, on the same card at a 1024 bake:
 
-| | |
-|---|---|
-| wall clock | ~160s total, of which ~48–70s is the paint pass |
-| attributes | `NORMAL`, `POSITION`, `TEXCOORD_0` + a baked albedo |
-| peak VRAM reserved | 6.77 GiB against 6.96 GiB free |
+| | one image | front + left + back |
+|---|---|---|
+| wall clock | ~160s total | ~254s total |
+| of which the paint pass | ~48–70s | ~46s |
+| attributes | `NORMAL`, `POSITION`, `TEXCOORD_0` + a baked albedo | same |
+| peak VRAM reserved | 6.77 GiB of 6.96 | 6.76 GiB of 6.96 |
+
+Multiview and paint stack without stacking their memory: the shape pipeline
+is released before the paint models load, so the peak is the larger of the
+two stages rather than their sum. That teardown is the difference between a
+70s paint pass and a 157s one — see
+[`docs/paint-spike-2026-09-06.md`](docs/paint-spike-2026-09-06.md).
 
 The model reloads on every call — each generation is a fresh subprocess —
 which is where the 35s floor comes from.

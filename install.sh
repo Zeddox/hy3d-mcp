@@ -113,7 +113,10 @@ bad()  { printf '  %sFAILED%s  %s\n' "$RED" "$RST" "$*"; FAILED=1; }
 phase(){ printf '\n%s[%s/6] %s%s\n' "$DIM" "$1" "$2" "$RST"; }
 
 usage() {
-    sed -n '3,22p' "$0" | sed 's/^# \{0,1\}//'
+    # From the third line to the end of the header comment, rather than a
+    # fixed range: the header has already grown twice past a hardcoded 22
+    # and silently truncated its own help.
+    sed -n '3,/^[^#]/p' "$0" | sed 's/^# \{0,1\}//;$d'
     exit 0
 }
 

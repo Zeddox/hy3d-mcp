@@ -96,6 +96,57 @@ anything the back view invents is kept wherever the front cannot see it.
 Feeding the paint pass the same back view the multiview shape pass gets is
 the obvious next experiment, and `__call__` already accepts a list of images.
 
+## What painting does to the geometry: nothing, and the checks disagree
+
+A painted GLB reports `watertight: false`, on the same faces the shape stage
+called watertight. That is UV unwrapping, not damage.
+
+| | vertices | faces | `is_watertight` | euler |
+|---|---|---|---|---|
+| shape only | 20,002 | 40,000 | true | 2 |
+| after paint | 24,929 | 40,000 | **false** | 212 |
+| after paint, merged by position | 20,002 | 40,000 | true | 2 |
+
+`xatlas` cuts the surface into charts and duplicates the vertices along every
+seam so each side can carry its own UV. `is_watertight` asks whether every
+edge is shared by exactly two faces *by vertex index*, so the cuts read as
+holes. Merging by position restores watertight, euler 2, a single body and
+zero broken faces — the surface never opened.
+
+Two places had to act on that:
+
+* `workers/tostl.py` merges before it checks or writes. STL carries no UVs,
+  so nothing is lost, and without it a painted model was both reported
+  unprintable and handed to a slicer as an open shell. On the same mesh the
+  painted STL now matches the untextured one exactly: 154.7 cm³, 33.9% bbox
+  fill, `printable: true`.
+* `engine_cli` measures the stat on a merged **copy**, so the number
+  describes the geometry. The copy is thrown away — merging in place keeps
+  one arbitrary UV per position and breaks the texture.
+
+## The material fix that was not applied
+
+Worth recording because the mistake is invisible from the mesh object.
+Setting `metallicFactor = 0.0` on what the paint pipeline returns does
+nothing: it hands back a `SimpleMaterial`, which has no such field, so the
+assignment lands on an unused attribute and trimesh's exporter runs its own
+`to_pbr()` with `metallicFactor` unset — which glTF reads as the 1.0 default.
+Every painted GLB shipped with metallic 1.0 and roughness 0.9036 while the
+code read as if it had been fixed. 0.9036 is `(2/(glossiness+2))**0.25` and
+is the tell that the conversion ran.
+
+The fix converts to `PBRMaterial` first and assigns the result back. The
+guard against a repeat is `glb_material` in the stats: it reads both factors
+back out of the written file, so the claim is measured rather than asserted.
+
+## Chaining
+
+`finish_model` now has something to chain onto — painted output is the first
+textured GLB this server produces. Verified on the viking: attributes and
+base colour survive the round trip, and the pass sets metallic 0 / roughness
+1 itself. `accent_coverage_pct` came back 0.0, which is the extractor's
+range (it keys on broad saturated red-dominant panels) rather than a fault.
+
 ## Reproducing it
 
 ```sh
@@ -105,6 +156,14 @@ python scripts/paint-weights.py ~/.cache/hy3dgen/tencent/Hunyuan3D-2/hunyuan3d-p
 
 The weights themselves are the delight model (4.1GB) plus the turbo paint
 subfolder, skipping `unet/diffusion_pytorch_model.bin` — see the note above.
+
+**The fresh `--with-paint` install has not been run end to end.** Every
+piece of phase 5 has been exercised by hand with the same argv, and
+`bash -n` passes, but the weights were already present on this box, so
+`install.sh --with-paint` has only ever taken the skip path. The download
+block, the `paint-weights.py` call and the `build-rasterizer.sh` invocation
+have not run in that order on a clean machine. First person to try it
+should expect to debug phase 5, not the pipeline.
 
 `scripts/build-rasterizer.sh` is idempotent and re-runnable. Note that
 `install.sh --only 3` rebuilds the engine venv, which discards the compiled

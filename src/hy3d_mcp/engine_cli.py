@@ -111,6 +111,45 @@ def glb_attributes(path):
         return ["<unreadable: %s>" % e]
 
 
+def glb_material(path):
+    """The PBR factors as written, read back from the file.
+
+    Asserting a material fix in memory is not the same as shipping one: the
+    paint pipeline returns a SimpleMaterial whose metallicFactor assignment
+    goes nowhere, and the exporter then substitutes its own defaults. That
+    failure is invisible from the mesh object and obvious from the file, so
+    read the file.
+    """
+    try:
+        import pygltflib
+        g = pygltflib.GLTF2().load(str(path))
+        if not g.materials:
+            return None
+        pbr = g.materials[0].pbrMetallicRoughness
+        if pbr is None:
+            return None
+        # glTF's own defaults when a factor is absent, so the numbers here
+        # are what a renderer will use rather than what the file spells out.
+        return {"metallic": 1.0 if pbr.metallicFactor is None
+                            else round(float(pbr.metallicFactor), 3),
+                "roughness": 1.0 if pbr.roughnessFactor is None
+                             else round(float(pbr.roughnessFactor), 3),
+                "base_color_texture": pbr.baseColorTexture is not None}
+    except Exception as e:
+        return {"error": str(e)}
+
+
+def watertight_probe(mesh):
+    """A positionally merged copy, for topology questions only.
+
+    See the note at the ``watertight`` stat. Never export this: the merge
+    keeps one arbitrary UV per position and so breaks the texture.
+    """
+    probe = mesh.copy()
+    probe.merge_vertices(merge_tex=True, merge_norm=True)
+    return probe
+
+
 def run_paint(mesh, image, texture_size):
     """Texture a mesh in place of its bare geometry. Returns (mesh, load_s, paint_s).
 
@@ -392,7 +431,19 @@ def main():
         # trimesh's PBR default is metallicFactor 1.0, which renders a baked
         # albedo as near-black in Godot until an environment map saves it. The
         # texture the paint pass produces is diffuse colour, so say so.
-        material = getattr(mesh.visual, "material", None)
+        #
+        # Setting the factors on what the paint pipeline returns is not
+        # enough. It hands back a SimpleMaterial, which has no metallicFactor
+        # field, so the assignment lands silently on an unused attribute and
+        # the GLB exporter's own to_pbr() writes the 1.0 default anyway --
+        # alongside a roughness of 0.9036, which is (2/(glossiness+2))**0.25
+        # and the tell that this conversion ran. Convert here instead, and
+        # assign the result back: to_pbr() returns a new object.
+        visual = mesh.visual
+        material = getattr(visual, "material", None)
+        if material is not None and not hasattr(material, "metallicFactor"):
+            material = material.to_pbr()
+            visual.material = material
         if material is not None:
             material.metallicFactor = 0.0
             material.roughnessFactor = 1.0
@@ -410,10 +461,20 @@ def main():
         "vertices": int(len(mesh.vertices)),
         "faces": int(len(mesh.faces)),
         "raw_faces": raw_faces,
-        "watertight": bool(mesh.is_watertight),
+        # Painting rewraps the UVs, and every atlas seam splits the vertices
+        # along it: the same 40,000 faces arrive carrying 24,929 vertices
+        # instead of 20,002. The surface did not change, but is_watertight
+        # asks whether faces share vertices, so it reports False on a mesh
+        # that is still closed -- merging by position restores watertight,
+        # euler 2, one body, no broken faces. Ask a merged copy, so the
+        # number describes the geometry rather than the atlas. The copy is
+        # thrown away: merging in place would collapse exactly the duplicate
+        # UVs the texture is painted against.
+        "watertight": bool(watertight_probe(mesh).is_watertight),
         "multiview": multiview,
         "views": list(images),
         "glb_attributes": glb_attributes(out),
+        "glb_material": glb_material(out) if painting else None,
         "textured": painting,
         "load_s": round(load_s, 1) if load_s is not None else None,
         "generate_s": round(gen_s, 1) if gen_s is not None else None,

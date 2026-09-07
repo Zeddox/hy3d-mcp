@@ -24,6 +24,14 @@ back can see may come out differently there; if the user cares about the
 back, generate the shape multiview *and* say that the paint pass still
 works from the front image alone.
 
+A painted GLB reports `watertight: false` in any third-party tool, and its
+geometry is unchanged: UV unwrapping splits vertices along the atlas seams,
+and `is_watertight` asks whether faces share vertices. This server merges by
+position before reporting the stat, and `export_stl` merges before it checks
+or writes, so a painted model still prints with identical volume and fill to
+the untextured original. Say that if the user notices it elsewhere; do not
+run a repair pass over it.
+
 Check `paint_ready` in `server_status` before promising a texture. It is a
 soft check — shape generation is unaffected by it — and when it is false it
 names which half is missing, the weights or the compiled rasterizer, each
@@ -259,4 +267,5 @@ Read the result properly before calling anything printable:
   inside the generation call, on the raw mesh, and preserves
   watertightness. Do not run a separate remesh or repair pass over a
   finished GLB.
-- User wants colour → they need a texturing step outside this server.
+- User wants colour → `paint=True`, or `paint_mesh` on a GLB they already
+  have. No trip outside this server since 0.10.0.

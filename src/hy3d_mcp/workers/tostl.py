@@ -10,6 +10,11 @@ Two conversions matter and neither is optional:
   unscaled export arrives as a 2mm trinket. Scale to a real height.
 * **Up axis.** glTF is Y-up; slicers are Z-up. Skipping this lands the
   model on its side on the build plate.
+* **UV seams.** A textured GLB carries duplicated vertices along every
+  atlas seam, so it reads as non-watertight even though the surface is
+  closed. STL has no UVs to protect, so merge by position first --
+  otherwise a painted model is reported unprintable and, worse, handed to
+  a slicer as an open shell.
 
 Also drops the mesh onto z=0 so it sits on the plate rather than floating,
 and reports the manifold checks that decide whether the file slices at all.
@@ -34,6 +39,11 @@ def main():
     args = ap.parse_args()
 
     mesh = trimesh.load(args.glb, force="mesh")
+    # Before any check: painted meshes arrive split along their UV seams
+    # (20,002 vertices become 24,929 on the same 40,000 faces). This is a
+    # no-op on an untextured mesh and restores watertightness on a painted
+    # one. STL drops UVs anyway, so nothing is lost here.
+    mesh.merge_vertices(merge_tex=True, merge_norm=True)
     checks = {
         "watertight": bool(mesh.is_watertight),
         "consistent_winding": bool(mesh.is_winding_consistent),
