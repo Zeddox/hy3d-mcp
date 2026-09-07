@@ -708,8 +708,16 @@ def export_stl(
     identical silhouettes; the enclosed volume is what separates them, and
     no preview render will show you the difference. Under ~15% means walls
     thin enough that the slicer may drop them.
-    min_wall_mm warns when the finest detail present falls under roughly two
-    perimeters of a 0.4mm nozzle.
+    detail_pitch_mm is the surface sampling pitch: the median edge length at
+    the requested scale, which on an undecimated mesh is exactly
+    height_mm / octree. min_wall_mm is roughly two perimeters of your nozzle
+    -- 0.8 for the common 0.4mm, 0.4 for a 0.2mm -- and the pitch is warned
+    against it in both directions, because they are different problems. A
+    pitch under it means the mesh carries detail the printer cannot lay
+    down, which softens in the slice; a pitch well over it means the mesh is
+    the limit rather than the printer, and max_faces or octree is where to
+    look. Do not read the pitch off the old p1 edge intuition: marching
+    cubes leaves a long tail of sub-micron slivers that are not features.
     """
     src = Path(glb_path).expanduser().resolve()
     if not src.is_file():

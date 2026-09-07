@@ -245,9 +245,15 @@ Read the result properly before calling anything printable:
   show.** A hollow shell and a solid can both pass every check above with
   identical silhouettes. Under ~15% means walls thin enough that the slicer
   may drop them.
-- `finest_detail_mm` — warns when the finest feature present falls under
-  roughly two perimeters of a 0.4mm nozzle. It will often warn; that means
-  the smallest details will soften, not that the print will fail.
+- `detail_pitch_mm` — the surface sampling pitch at the requested scale.
+  On an undecimated mesh this is exactly `height_mm / octree`, so a 384
+  mesh printed 120mm tall samples every 0.31mm. It is warned against
+  `min_wall_mm` in **both** directions, and they are different problems: a
+  pitch under the min wall means the mesh carries detail the nozzle cannot
+  lay down (print taller); a pitch well over it means the mesh, not the
+  printer, is the limit (raise `max_faces` or `octree`, or print smaller).
+  Set `min_wall_mm` to roughly two perimeters of the user's nozzle — 0.8
+  for the common 0.4mm, 0.4 for a 0.2mm — the default assumes 0.4mm.
 - `genus` — tunnels through the surface. Slices fine, but worth checking it
   is intentional rather than a reconstruction artefact.
 

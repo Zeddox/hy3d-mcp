@@ -85,15 +85,28 @@ def main():
     if not all(checks.values()):
         warnings.append("failed %s — repair before slicing"
                         % ", ".join(k for k, v in checks.items() if not v))
-    # The shortest edges are a cheap proxy for the finest detail present. This
-    # does not measure wall thickness, but a model whose detail is already
-    # sub-nozzle at this scale will lose it in the slice.
-    p1 = float(np.percentile(mesh.edges_unique_length, 1))
-    result["finest_detail_mm"] = round(p1, 2)
-    if p1 < args.min_wall:
-        warnings.append("finest detail ~%.2fmm is under the %.1fmm min-wall "
-                        "guide; scale up or expect it to be dropped"
-                        % (p1, args.min_wall))
+    # The median edge, not the shortest. Marching cubes leaves a long tail of
+    # near-degenerate edges wherever the isosurface clips a cell corner, and
+    # they are not features: on a 737k-face mesh at 120mm the 1st percentile
+    # edge is 0.014mm against a median of 0.318mm, so the old p1 reported
+    # sliver noise as if it were detail -- and 0.318 is exactly 120/384, the
+    # marching-cubes cell. The median lands on that cell size and so answers
+    # the question actually being asked: how fine a feature can this surface
+    # carry at this scale. Decimation inflates it, which is honest -- a 40k
+    # mesh really has thrown the fine sampling away.
+    pitch = float(np.percentile(mesh.edges_unique_length, 50))
+    result["detail_pitch_mm"] = round(pitch, 2)
+    # Both directions are worth saying, because they are different problems.
+    if pitch < args.min_wall:
+        warnings.append("surface pitch ~%.2fmm is finer than the %.1fmm "
+                        "min-wall guide; the finest detail will soften in the "
+                        "slice -- print taller to express it"
+                        % (pitch, args.min_wall))
+    elif pitch > 2 * args.min_wall:
+        warnings.append("surface pitch ~%.2fmm is coarser than the %.1fmm "
+                        "min-wall guide; the printer can resolve more than "
+                        "this mesh carries -- raise max_faces or octree, or "
+                        "print smaller" % (pitch, args.min_wall))
     if genus:
         warnings.append("genus %d — the surface has %d tunnel(s) through it; "
                         "slices fine, but check it is intentional" % (genus, genus))

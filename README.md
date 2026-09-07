@@ -408,8 +408,11 @@ which is where the 35s floor comes from.
 `export_stl` rotates glTF's Y-up into the Z-up every slicer expects,
 scales to a target height in millimetres (STL is unitless and read as mm),
 and drops the model onto the bed at the origin. It reports enclosed
-volume, bounding-box fill, genus, and four solidity checks, and warns when
-the finest detail in the mesh falls below your nozzle's minimum wall.
+volume, bounding-box fill, genus, and four solidity checks, and reports
+`detail_pitch_mm` — the surface sampling pitch at that scale, which on an
+undecimated mesh is exactly `height_mm / octree`. It is warned against
+`min_wall_mm` in both directions: below it the printer is the limit, well
+above it the mesh is.
 
 ## Non-goals
 
