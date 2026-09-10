@@ -412,6 +412,16 @@ which is where the 35s floor comes from.
   model emits *more* than the full 2.0 and holds edges less crisply.
   `max_faces` (default 40,000) decimates to a game-ready count and the
   result stays watertight.
+- **"Separator is not found, and chunk exceed the limit" (fixed in 0.12.2).**
+  This one is worth knowing about because of what it did *not* do. The
+  server read the engine's output a line at a time, and asyncio caps a line
+  at 64KiB; tqdm redraws its bars with a carriage return and no newline, so
+  the whole volume-decode bar counted as one line and blew that cap. The
+  job was reported as failed — but the exception skipped the path that
+  kills the child, so the engine ran on, orphaned, and wrote a complete and
+  perfectly good GLB. If you saw this error before 0.12.2, look in your
+  output directory: the mesh is almost certainly there.
+
 - **Long jobs and client timeouts.** The progress stream is what keeps a
   client's idle timer alive; if yours still gives up, raise its tool
   timeout (Claude Code: `CLAUDE_CODE_MCP_TOOL_IDLE_TIMEOUT`, or a

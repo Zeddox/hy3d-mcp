@@ -17,6 +17,7 @@ Config (env, with defaults):
   HY3D_OUT   default output directory      (~/hy3d-output)
 """
 import asyncio
+import codecs
 import contextlib
 import fcntl
 import json
@@ -199,6 +200,14 @@ def _has_real_alpha(path: Path) -> bool:
 
 _PROGRESS_LINE = re.compile(r"^\s*\[\s*(\d+)\s*%\]\s*(.*)$")
 
+# A terminal's two line endings, not one. tqdm redraws a bar by returning the
+# carriage without a newline, so to readline() a whole progress bar is a single
+# line -- and at octree 384 the volume-decode bar runs past asyncio's 64KiB
+# default, which surfaces as ValueError("Separator is not found, and chunk
+# exceed the limit") and takes the run with it.
+_EOL = re.compile(r"\r\n|\r|\n")
+_READ_CHUNK = 65536
+
 
 def _mmss(seconds: float) -> str:
     return "%dm%02ds" % (int(seconds) // 60, int(seconds) % 60)
@@ -245,16 +254,52 @@ async def _run_engine(cmd: list[str], env: dict[str, str], ctx: Context | None,
         # child, which presents as exactly the hang this is here to prevent.
         # The text is accumulated as well as streamed — the vert/face regex and
         # the failure message downstream both need the whole thing.
-        async for raw in stream:
-            line = raw.decode("utf-8", "replace")
-            buf.append(line)
-            if not watch:
-                continue
-            m = _PROGRESS_LINE.match(line)
-            if m:
-                await report(
-                    state["base"] + float(m.group(1)) / 100.0 * state["width"],
-                    "%s: %s" % (state["stage"], m.group(2).strip()))
+        #
+        # Read by chunk and split by hand rather than iterating the stream,
+        # which is readline() and has the 64KiB ceiling _EOL describes. The
+        # decoder is incremental because a chunk boundary lands mid-character
+        # sooner or later, and tqdm's bars are made of multibyte blocks.
+        decode = codecs.getincrementaldecoder("utf-8")("replace").decode
+        pending = ""
+        redraw = False  # the last line in buf came from a \r and is overwritable
+        eof = False
+        while not eof:
+            chunk = await stream.read(_READ_CHUNK)
+            pending += decode(chunk, not chunk)
+            eof = not chunk
+            while True:
+                m = _EOL.search(pending)
+                # A trailing \r is held back: the \n that would pair with it
+                # into one ending may simply be in the next chunk.
+                if m is not None and not eof and m.end() == len(pending) \
+                        and m.group(0) == "\r":
+                    m = None
+                if m is None:
+                    if not (eof and pending):
+                        break
+                    line, term = pending, ""
+                    pending = ""
+                else:
+                    line, term = pending[:m.start()], m.group(0)
+                    pending = pending[m.end():]
+                # A carriage return means the terminal drew this line over the
+                # last one, so keep the newest state instead of six hundred
+                # redraws of the same bar: the stderr tail an engine failure
+                # reports is the last 2000 characters, and a wall of progress
+                # bar there hides the traceback it exists to show.
+                if redraw:
+                    buf.pop()
+                buf.append(line + "\n" if term else line)
+                redraw = term == "\r"
+                if watch:
+                    m2 = _PROGRESS_LINE.match(line)
+                    if m2:
+                        await report(
+                            state["base"]
+                            + float(m2.group(1)) / 100.0 * state["width"],
+                            "%s: %s" % (state["stage"], m2.group(2).strip()))
+                if not term:
+                    break
 
     async def heartbeat() -> None:
         # Volume decoding is the majority of the run and emits no line the
@@ -272,6 +317,10 @@ async def _run_engine(cmd: list[str], env: dict[str, str], ctx: Context | None,
     meta = getattr(getattr(ctx, "request_context", None), "meta", None)
     streamed = getattr(meta, "progressToken", None) is not None
 
+    def kill() -> None:
+        if proc.returncode is None:
+            proc.kill()
+
     beat = asyncio.create_task(heartbeat())
     try:
         async with asyncio.timeout(GENERATE_TIMEOUT):
@@ -279,12 +328,21 @@ async def _run_engine(cmd: list[str], env: dict[str, str], ctx: Context | None,
                                  drain(proc.stderr, err, False))
             rc = await proc.wait()
     except TimeoutError:
-        proc.kill()
+        kill()
         await proc.wait()
         raise RuntimeError("engine ran past %.0fs and was killed"
                            % GENERATE_TIMEOUT)
     except asyncio.CancelledError:
-        proc.kill()
+        kill()
+        await proc.wait()
+        raise
+    except BaseException:
+        # Any other way out leaves the engine running. gather() propagates the
+        # moment a drain raises, so proc.wait() never runs, the finally clears
+        # _current_proc — and the orphan goes on to finish, holding the GPU and
+        # writing its GLB for a job already reported as failed, with nothing
+        # left that can cancel it. Whatever broke, do not leak the child.
+        kill()
         await proc.wait()
         raise
     finally:
